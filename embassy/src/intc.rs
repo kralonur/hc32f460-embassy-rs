@@ -33,6 +33,19 @@ pub const MAX_LINE: u8 = 143;
 /// Largest valid event source number (0x1FF is the unmapped marker, not an event).
 pub const MAX_EVENT: u16 = 510;
 
+// RM Table 10-2 groups peripheral sources into sets of 32 events.
+const EVENTS_PER_GROUP: u16 = 32;
+// RM Table 10-2 assigns six selectable NVIC lines to each event group.
+const LINES_PER_GROUP: u32 = 6;
+// RM Table 10-2 allows the first 32 selectable lines to serve any event.
+const UNRESTRICTED_LINES: u8 = 32;
+// HC32F460 implements four NVIC priority bits (vendor SVD cpu.nvicPrioBits).
+const PRIORITY_BITS: u8 = 4;
+// RM section 10.5.5 defines external-interrupt channels EIRQ0 through EIRQ15.
+const EIRQ_CHANNELS: u8 = 16;
+// The SVD defines word-wide SEL and EIRQCR registers at four-byte intervals.
+const REGISTER_BYTES: usize = core::mem::size_of::<u32>();
+
 /// Trigger selection for an external interrupt line (RM §10.5.5 `EIRQTRG`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EirqTrigger {
@@ -86,10 +99,10 @@ unsafe impl cortex_m::interrupt::InterruptNumber for Line {
 /// `0..=127`. Groups whose window starts at or beyond 128 can only use the
 /// shared VSSEL lines, which this HAL does not support.
 pub fn group_window(event: u16) -> Option<(u8, u8)> {
-    let group = (event / 32) as u32;
-    let low = 32 + group * 6;
-    let high = low + 5;
-    if high <= 127 {
+    let group = u32::from(event / EVENTS_PER_GROUP);
+    let low = u32::from(UNRESTRICTED_LINES) + group * LINES_PER_GROUP;
+    let high = low + LINES_PER_GROUP - 1;
+    if high < u32::from(ROUTABLE_LINES) {
         Some((low as u8, high as u8))
     } else {
         None
@@ -104,7 +117,7 @@ pub fn can_route(event: u16, line: Line) -> Result<(), IrqError> {
     if line.is_shared() {
         return Err(IrqError::SharedLineUnsupported);
     }
-    if line.n() < 32 {
+    if line.n() < UNRESTRICTED_LINES {
         return Ok(());
     }
     match group_window(event) {
@@ -146,7 +159,7 @@ pub fn register_with(
     line: Line,
     priority: u8,
 ) -> Result<(), IrqError> {
-    if priority > 15 {
+    if priority >= 1 << PRIORITY_BITS {
         return Err(IrqError::PriorityInvalid);
     }
     can_route(event, line)?;
@@ -198,16 +211,27 @@ pub fn owner(io: &mut impl Registers, line: Line) -> Option<u16> {
 
 // ---------------------------------------------------------------- hardware ---
 
-const INTC: usize = 0x40051000;
+// HC32F460 vendor SVD: INTC peripheral base address, in bytes.
+const INTC: usize = 0x4005_1000;
+// Vendor SVD: SEL0 begins at byte offset 0x5C within INTC.
 const SEL0: usize = INTC + 0x5C;
+// Vendor SVD: EIRQCR0 begins at byte offset 0x10 within INTC.
 const EIRQCR0: usize = INTC + 0x10;
+// Vendor SVD: external-interrupt flags at byte offset 0x54 within INTC.
 const EIFR: usize = INTC + 0x54;
+// Vendor SVD: external-interrupt flag clear at byte offset 0x58 within INTC.
 const EIFCR: usize = INTC + 0x58;
+// Vendor SVD: software-interrupt requests at byte offset 0x29C within INTC.
 const SWIER: usize = INTC + 0x29C;
+// Vendor SVD: interrupt-event request enables at byte offset 0x2A4 within INTC.
 const IER: usize = INTC + 0x2A4;
+// ARM Cortex-M4 core map: NVIC interrupt-clear-enable register base, in bytes.
 const NVIC_ICER: usize = 0xE000_E180;
+// ARM Cortex-M4 core map: NVIC interrupt-clear-pending register base, in bytes.
 const NVIC_ICPR: usize = 0xE000_E280;
+// ARM Cortex-M4 core map: NVIC interrupt-set-enable register base, in bytes.
 const NVIC_ISER: usize = 0xE000_E100;
+// ARM Cortex-M4 core map: NVIC byte-wide interrupt-priority register base.
 const NVIC_IPR: usize = 0xE000_E400;
 
 struct Hardware;
@@ -215,31 +239,45 @@ struct Hardware;
 impl Registers for Hardware {
     fn read_sel(&mut self, line: Line) -> u32 {
         // SAFETY: Line is valid and SEL registers are word-aligned, readable INTC registers.
-        unsafe { ((SEL0 + 4 * line.n() as usize) as *const u32).read_volatile() }
+        unsafe { ((SEL0 + REGISTER_BYTES * usize::from(line.n())) as *const u32).read_volatile() }
     }
     fn write_sel(&mut self, line: Line, value: u32) {
         // SAFETY: Line is valid and SEL registers are word-aligned, writable INTC registers.
-        unsafe { ((SEL0 + 4 * line.n() as usize) as *mut u32).write_volatile(value) }
+        unsafe {
+            ((SEL0 + REGISTER_BYTES * usize::from(line.n())) as *mut u32).write_volatile(value)
+        }
     }
     fn nvic_disable(&mut self, line: Line) {
-        let n = line.n() as usize;
+        let n = usize::from(line.n());
+        let bits = u32::BITS as usize;
         // SAFETY: Line selects an implemented NVIC interrupt-clear-enable register bit.
-        unsafe { ((NVIC_ICER + (n / 32) * 4) as *mut u32).write_volatile(1 << (n % 32)) }
+        unsafe {
+            ((NVIC_ICER + (n / bits) * REGISTER_BYTES) as *mut u32).write_volatile(1 << (n % bits))
+        }
     }
     fn nvic_clear_pending(&mut self, line: Line) {
-        let n = line.n() as usize;
+        let n = usize::from(line.n());
+        let bits = u32::BITS as usize;
         // SAFETY: Line selects an implemented NVIC interrupt-clear-pending register bit.
-        unsafe { ((NVIC_ICPR + (n / 32) * 4) as *mut u32).write_volatile(1 << (n % 32)) }
+        unsafe {
+            ((NVIC_ICPR + (n / bits) * REGISTER_BYTES) as *mut u32).write_volatile(1 << (n % bits))
+        }
     }
     fn nvic_set_priority(&mut self, line: Line, priority: u8) {
         // Four implemented priority bits, left-aligned in the IPR byte.
         // SAFETY: Line selects an implemented byte-wide NVIC priority register.
-        unsafe { ((NVIC_IPR + line.n() as usize) as *mut u8).write_volatile(priority << 4) }
+        unsafe {
+            ((NVIC_IPR + usize::from(line.n())) as *mut u8)
+                .write_volatile(priority << (u8::BITS as u8 - PRIORITY_BITS))
+        }
     }
     fn nvic_enable(&mut self, line: Line) {
-        let n = line.n() as usize;
+        let n = usize::from(line.n());
+        let bits = u32::BITS as usize;
         // SAFETY: Line selects an implemented NVIC interrupt-set-enable register bit.
-        unsafe { ((NVIC_ISER + (n / 32) * 4) as *mut u32).write_volatile(1 << (n % 32)) }
+        unsafe {
+            ((NVIC_ISER + (n / bits) * REGISTER_BYTES) as *mut u32).write_volatile(1 << (n % bits))
+        }
     }
 }
 
@@ -277,22 +315,22 @@ pub fn route_owner(line: Line) -> Option<u16> {
 /// The pin itself must also have `PCR.INTE` set; see RM §10.4.2 for the full
 /// sequence (pin EIRQ input, `EIRQCRn`, `SELn`, `IER`, NVIC).
 pub fn configure_eirq(pin: u8, trigger: EirqTrigger) {
-    assert!(pin < 16);
+    assert!(pin < EIRQ_CHANNELS);
     let value = trigger as u32;
     // SAFETY: The checked pin selects one of the word-aligned EIRQ configuration registers.
-    unsafe { ((EIRQCR0 + 4 * pin as usize) as *mut u32).write_volatile(value) }
+    unsafe { ((EIRQCR0 + REGISTER_BYTES * usize::from(pin)) as *mut u32).write_volatile(value) }
 }
 
 /// Pending external-interrupt flag for a pin position.
 pub fn eirq_pending(pin: u8) -> bool {
-    assert!(pin < 16);
+    assert!(pin < EIRQ_CHANNELS);
     // SAFETY: EIFR is a word-aligned, readable external-interrupt status register.
     unsafe { ((EIFR) as *const u32).read_volatile() & (1 << pin) != 0 }
 }
 
 /// Clear the external-interrupt flag for a pin position (write 1 clears).
 pub fn eirq_clear(pin: u8) {
-    assert!(pin < 16);
+    assert!(pin < EIRQ_CHANNELS);
     // SAFETY: EIFCR is a word-aligned write-one-to-clear register; pin was checked above.
     unsafe { ((EIFCR) as *mut u32).write_volatile(1 << pin) }
 }
@@ -302,7 +340,7 @@ pub fn eirq_clear(pin: u8) {
 /// RM §10.5.12: the bit stays set until software writes 0, so the handler must
 /// call [`software_interrupt_clear`] or the request re-fires.
 pub fn software_interrupt_trigger(channel: u8) {
-    assert!(channel < 32);
+    assert!(u32::from(channel) < u32::BITS);
     let bit = 1u32 << channel;
     // SAFETY: SWIER is word-aligned and supports the checked software-interrupt channel.
     unsafe {
@@ -313,7 +351,7 @@ pub fn software_interrupt_trigger(channel: u8) {
 
 /// Clear a software interrupt channel after handling it.
 pub fn software_interrupt_clear(channel: u8) {
-    assert!(channel < 32);
+    assert!(u32::from(channel) < u32::BITS);
     let bit = 1u32 << channel;
     // SAFETY: SWIER is word-aligned and supports the checked software-interrupt channel.
     unsafe {
@@ -324,7 +362,10 @@ pub fn software_interrupt_clear(channel: u8) {
 
 /// Enable or disable an interrupt event request in `IER`.
 pub fn event_request_enable(event: u16, enable: bool) {
-    assert!(event < 32, "IER only covers the first 32 event requests");
+    assert!(
+        u32::from(event) < u32::BITS,
+        "IER only covers the first 32 event requests"
+    );
     let bit = 1u32 << event;
     // SAFETY: IER is word-aligned and event selects one of its documented request bits.
     unsafe {
