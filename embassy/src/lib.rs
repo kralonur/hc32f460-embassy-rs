@@ -9,6 +9,7 @@ pub mod clocks;
 pub mod exti;
 pub mod gpio;
 pub mod intc;
+pub mod pwm;
 pub mod time_driver;
 
 /// Initialize the 1 kHz SysTick after the board configures its clocks.
