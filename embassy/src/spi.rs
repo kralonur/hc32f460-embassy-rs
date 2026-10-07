@@ -19,18 +19,39 @@ const IRQ_PRIORITY: u8 = 8;
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 // Original driver's cooperative scheduling interval, in transmitted bytes.
 const YIELD_BYTES: usize = 64;
-const DR: usize = 0;
-const CR1: usize = 4;
-const CFG1: usize = 12;
-const SR: usize = 20;
-const CFG2: usize = 24;
-const ERRORS: u32 = 0x1d;
+// Vendor SVD / RM 27.12.1: SPI data register byte offset.
+const DR: usize = 0x00;
+// Vendor SVD / RM 27.12.2: SPI control register byte offset.
+const CR1: usize = 0x04;
+// Vendor SVD / RM 27.12.3: first SPI configuration register byte offset.
+const CFG1: usize = 0x0c;
+// Vendor SVD / RM 27.12.4: SPI status register byte offset.
+const SR: usize = 0x14;
+// Vendor SVD / RM 27.12.5: second SPI configuration register byte offset.
+const CFG2: usize = 0x18;
+// Vendor SVD: SR.OVRERF (bit 0) reports receive overrun.
+const OVERRUN: u32 = 1 << 0;
+// Vendor SVD: SR.MODFERF (bit 2) reports a mode fault.
+const MODE_FAULT: u32 = 1 << 2;
+// Vendor SVD: SR.PERF (bit 3) reports a parity error.
+const PARITY_ERROR: u32 = 1 << 3;
+// Vendor SVD: SR.UDRERF (bit 4) reports transmit underrun.
+const UNDERRUN: u32 = 1 << 4;
+// Original driver's error set, composed from the SVD's status flags (formerly 0x1D).
+const ERRORS: u32 = OVERRUN | MODE_FAULT | PARITY_ERROR | UNDERRUN;
+// Vendor SVD: SR.IDLNF (bit 1) is set while SPI is not idle.
 const BUSY: u32 = 1 << 1;
+// Vendor SVD: SR.TDEF (bit 5) indicates the transmit buffer is empty.
 const EMPTY: u32 = 1 << 5;
+// Vendor SVD: CR1.EIE (bit 8) enables error interrupts.
 const EIE: u32 = 1 << 8;
+// Vendor SVD: CR1.TXIE (bit 9) enables transmit-empty interrupts.
 const TXIE: u32 = 1 << 9;
+// Vendor SVD: CR1.RXIE (bit 10) enables receive-full interrupts.
 const RXIE: u32 = 1 << 10;
+// Vendor SVD: CR1.IDIE (bit 11) enables idle interrupts.
 const IDIE: u32 = 1 << 11;
+// Mask of all SPI interrupt enables owned by this driver.
 const INTERRUPTS: u32 = EIE | TXIE | RXIE | IDIE;
 static WAKER: AtomicWaker = AtomicWaker::new();
 
@@ -187,6 +208,7 @@ impl Spi3 {
         critical_section::with(|_| {
             // PWC FCG1 controls SPI3's clock with an active-low gate at bit 18.
             const CLOCK_GATE: usize = 0x4004_8004;
+            // Vendor SVD: FCG1.SPI3 (bit 18) disables the SPI3 clock when set.
             const CLOCK_BIT: u32 = 1 << 18;
             // SAFETY: FCG1 is word-aligned and the caller guarantees PWC write
             // access. The critical section serializes this read-modify-write.
