@@ -1,0 +1,16 @@
+[package]
+name = "embassy-hc32"
+version = "0.1.0"
+edition = "2024"
+description = "Embassy HAL and runtime support for Xiaohua / HDSC HC32F460 microcontrollers"
+license = "MIT OR Apache-2.0"
+# The generated PAC's redistribution terms still require review.
+publish = false
+categories = ["embedded", "hardware-support", "no-std"]
+keywords = ["arm", "cortex-m", "hc32", "hal", "embassy"]
+
+[package.metadata.docs.rs]
+targets = ["thumbv7em-none-eabihf"]
+
+[dependencies]
+hc32f460-pac = { path = "../pac", default-features = false }
