@@ -1,0 +1,24 @@
+[package]
+name = "hc32f460-pac"
+version = "0.1.0"
+edition = "2024"
+description = "Peripheral access crate for the Xiaohua / HDSC HC32F460 ARM Cortex-M4 microcontroller"
+license = "MIT OR Apache-2.0"
+# Vendor-derived definitions require a rights review before redistribution.
+publish = false
+categories = ["embedded", "hardware-support", "no-std"]
+keywords = ["arm", "cortex-m", "hc32", "pac"]
+
+[package.metadata.docs.rs]
+targets = ["thumbv7em-none-eabihf"]
+
+[dependencies]
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true, optional = true }
+critical-section = { workspace = true, optional = true }
+vcell = { workspace = true }
+
+[features]
+default = ["rt"]
+rt = ["cortex-m-rt/device"]
+critical-section = ["dep:critical-section"]
