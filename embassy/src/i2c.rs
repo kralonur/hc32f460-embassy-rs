@@ -149,7 +149,7 @@ pub enum Error {
     /// NACK, arbitration loss, or peripheral timeout.
     Bus,
     /// Operation did not complete inside its bound. The payload is the last
-    /// wait entered ([`STEP_*`]), which may differ from where time was spent.
+    /// wait entered (the `STEP_*` constants), which may differ from where time was spent.
     Timeout(u32),
     /// The bus clock cannot be represented for the current PCLK3.
     Clock,

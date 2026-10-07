@@ -19,7 +19,7 @@
 //! clear and went back to sleep. Every async-tilt image therefore counted edges
 //! but never flipped anything.
 //!
-//! Now the ISR clears `EIFR` **and sets a software latch** ([`EDGE`]); the waiter
+//! Now the ISR clears `EIFR` **and sets a software latch** (`EDGE`); the waiter
 //! consumes the latch. The latch is set before the wake and read after the
 //! waker is registered, so no edge can be lost in either direction.
 
