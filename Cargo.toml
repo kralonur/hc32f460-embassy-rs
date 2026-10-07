@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["embassy", "pac"]
+
+[workspace.dependencies]
+cortex-m = "0.7.9"
+cortex-m-rt = "0.7.7"
+critical-section = "1.2.0"
+embassy-futures = "0.1.2"
+embassy-sync = "0.6.2"
+embassy-time = "0.5.1"
+embassy-time-driver = "0.2.2"
+embassy-time-queue-utils = "0.3.2"
+embedded-hal = "1.0.0"
+embedded-hal-async = "1.0.0"
+vcell = "0.1.3"
