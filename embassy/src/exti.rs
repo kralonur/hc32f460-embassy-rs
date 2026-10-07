@@ -28,11 +28,14 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use embassy_sync::waitqueue::AtomicWaker;
 
-/// External-interrupt channels are pin positions: 0..=15.
+/// RM 10.5.5: external-interrupt channels EIRQ0..EIRQ15 match pin positions.
 pub const MAX_CHANNEL: u8 = 15;
 
+// One entry for each documented EIRQ channel, including channel zero.
+const CHANNEL_COUNT: usize = MAX_CHANNEL as usize + 1;
+
 /// One waker per channel; the ISR wakes, the task registers here.
-static WAKERS: [AtomicWaker; 16] = [const { AtomicWaker::new() }; 16];
+static WAKERS: [AtomicWaker; CHANNEL_COUNT] = [const { AtomicWaker::new() }; CHANNEL_COUNT];
 
 /// Software latch: bit `n` means "channel `n` has seen an edge that no waiter
 /// has consumed yet". Set by the ISR, consumed by the waiter.

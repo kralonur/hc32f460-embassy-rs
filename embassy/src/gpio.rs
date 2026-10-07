@@ -30,11 +30,75 @@ pub enum Level {
     High,
 }
 
+// Vendor SVD: GPIO peripheral base address, in bytes.
 const BASE: usize = 0x4005_3800;
+// RM 9.4.10 / SVD: port write-protection register at byte offset 0x3FC.
 const PWPR: usize = BASE + 0x3fc;
+// RM 9.4.7 / SVD: debug function-selection register at byte offset 0x3F4.
 const PSPCR: usize = BASE + 0x3f4;
-const POER: usize = 6;
-pub const PCR_INTE: u16 = 0x1000;
+// Vendor SVD: input-data register offset within each port, in bytes.
+const PIDR: usize = 0x00;
+// Vendor SVD: output-enable register offset within each port, in bytes.
+const POER: usize = 0x06;
+// Vendor SVD: write-one output-set register offset within each port, in bytes.
+const POSR: usize = 0x08;
+// Vendor SVD: write-one output-reset register offset within each port, in bytes.
+const PORR: usize = 0x0a;
+// Vendor SVD: write-one output-toggle register offset within each port, in bytes.
+const POTR: usize = 0x0c;
+// Vendor SVD: port data-register banks are spaced 16 bytes apart.
+const PORT_STRIDE: usize = 0x10;
+// Vendor SVD: PCRA0 starts at byte offset 0x400 within GPIO.
+const PCR_BASE: usize = 0x400;
+// Vendor SVD: PCR/PFSR banks for successive ports are spaced 64 bytes apart.
+const CONFIG_PORT_STRIDE: usize = 0x40;
+// Vendor SVD: successive pin PCR/PFSR pairs are spaced four bytes apart.
+const CONFIG_PIN_STRIDE: usize = 4;
+// Vendor SVD: each pin's PFSR follows its PCR by two bytes.
+const PFSR_OFFSET: usize = 2;
+// Vendor SVD: each A..E port data register has 16 pin bits.
+const PINS_PER_PORT: u8 = 16;
+// Vendor SVD: port H exposes PH0, PH1, and PH2.
+const H_PIN_COUNT: u8 = 3;
+// Original JEUA EXTI cleanup scope includes PC13..15, not every port C pin.
+const C_EXTI_FIRST_PIN: u8 = 13;
+// RM 9.4.10: WP=0xA5 in bits 15:8 supplies the key, WE=0 disables writes.
+const PWPR_LOCK: u16 = 0xa500;
+// RM 9.4.10: the same key with WE (bit 0) set enables protected writes.
+const PWPR_UNLOCK: u16 = PWPR_LOCK | 1;
+// RM 9.4.7: SPFE bits 2..4 retain JTAG functions; bits 0..1 retain SWD.
+const JTAG_FUNCTIONS: u16 = 0b111 << 2;
+// RM 9.4.12: FSEL bits 5:0 select one of 64 pin functions.
+const PFSR_FSEL: u16 = 0x3f;
+// RM 9.4.12: BFE (bit 8) enables the second pin function.
+const PFSR_BFE: u16 = 1 << 8;
+// RM 9.4.12: FSEL=0 selects GPIO rather than a peripheral function.
+const GPIO_FUNCTION: u8 = 0;
+// RM 9.4.11: POUT (bit 0) is the output-data latch.
+const PCR_POUT: u16 = 1 << 0;
+// RM 9.4.11: POUTE (bit 1) enables the output driver.
+const PCR_POUTE: u16 = 1 << 1;
+// RM 9.4.11: NOD (bit 2) selects open-drain rather than CMOS output.
+const PCR_NOD: u16 = 1 << 2;
+// RM 9.4.11: DRV bits 5:4 select the pin's drive strength.
+const PCR_DRV: u16 = 0b11 << 4;
+// RM 9.4.11: DRV=0b10 selects high driving force, as in the original driver.
+const PCR_DRV_HIGH: u16 = 0b10 << 4;
+// RM 9.4.11: PUU (bit 6) enables the internal pull-up resistor.
+const PCR_PUU: u16 = 1 << 6;
+// RM 9.4.11: PIN (bit 8) is read-only input status, not an enable.
+const PCR_PIN: u16 = 1 << 8;
+// RM 9.4.11: INVE (bit 9) inverts input/output data.
+const PCR_INVE: u16 = 1 << 9;
+/// RM 9.4.11: INTE (bit 12) enables external-interrupt input.
+pub const PCR_INTE: u16 = 1 << 12;
+// RM 9.4.11: LTE (bit 14) locks the output state during function changes.
+const PCR_LTE: u16 = 1 << 14;
+// RM 9.4.11: DDIS (bit 15) disables all digital pin functions.
+const PCR_DDIS: u16 = 1 << 15;
+// Original high-drive profile resets these PCR fields (formerly mask 0xD275).
+const OUTPUT_PROFILE_CLEAR: u16 =
+    PCR_DDIS | PCR_LTE | PCR_INTE | PCR_INVE | PCR_PUU | PCR_DRV | PCR_NOD | PCR_POUT;
 
 trait Registers {
     fn read(&mut self, address: usize) -> u16;
@@ -52,13 +116,13 @@ impl Registers for Mmio {
     }
 }
 fn validate(port: Port, pin: u8) {
-    assert!(pin < 16 && (port != Port::H || pin < 3));
+    assert!(pin < PINS_PER_PORT && (port != Port::H || pin < H_PIN_COUNT));
 }
 fn pcr(port: Port, pin: u8) -> usize {
-    BASE + 0x400 + port.index() * 0x40 + usize::from(pin) * 4
+    BASE + PCR_BASE + port.index() * CONFIG_PORT_STRIDE + usize::from(pin) * CONFIG_PIN_STRIDE
 }
 fn port_register(port: Port, offset: usize) -> usize {
-    BASE + port.index() * 0x10 + offset
+    BASE + port.index() * PORT_STRIDE + offset
 }
 fn modify(bus: &mut impl Registers, address: usize, clear: u16, set: u16) {
     let old = bus.read(address);
@@ -68,28 +132,33 @@ fn protected<R: Registers, T>(bus: &mut R, f: impl FnOnce(&mut R) -> T) -> T {
     struct Relock<'a, R: Registers>(&'a mut R);
     impl<R: Registers> Drop for Relock<'_, R> {
         fn drop(&mut self) {
-            self.0.write(PWPR, 0xa500);
+            self.0.write(PWPR, PWPR_LOCK);
         }
     }
     critical_section::with(|_| {
-        bus.write(PWPR, 0xa501);
+        bus.write(PWPR, PWPR_UNLOCK);
         let guard = Relock(bus);
         f(guard.0)
     })
 }
 fn function(bus: &mut impl Registers, port: Port, pin: u8, code: u8) {
-    assert!(code < 64);
-    modify(bus, pcr(port, pin) + 2, 0x13f, u16::from(code));
+    assert!(u16::from(code) <= PFSR_FSEL);
+    modify(
+        bus,
+        pcr(port, pin) + PFSR_OFFSET,
+        PFSR_FSEL | PFSR_BFE,
+        u16::from(code),
+    );
 }
 fn pull_up(bus: &mut impl Registers, port: Port, pin: u8, exti: bool) {
-    function(bus, port, pin, 0);
+    function(bus, port, pin, GPIO_FUNCTION);
     // PIN bit8 is read-only status, not an enable. Preserve the legacy EXTI
     // write's bit8 literal; hardware ignores it. DDIS/output cleared, PUU set.
     modify(
         bus,
         pcr(port, pin),
-        0x8003,
-        0x40 | if exti { 0x100 } else { 0 },
+        PCR_DDIS | PCR_POUTE | PCR_POUT,
+        PCR_PUU | if exti { PCR_PIN } else { 0 },
     );
 }
 fn high_drive(bus: &mut impl Registers, port: Port, pin: u8, level: Level, inte: bool) {
@@ -97,13 +166,16 @@ fn high_drive(bus: &mut impl Registers, port: Port, pin: u8, level: Level, inte:
     modify(
         bus,
         pcr(port, pin),
-        0xd275,
-        0x22 | u16::from(level == Level::High) | if inte { PCR_INTE } else { 0 },
+        OUTPUT_PROFILE_CLEAR,
+        PCR_POUTE
+            | PCR_DRV_HIGH
+            | u16::from(level == Level::High)
+            | if inte { PCR_INTE } else { 0 },
     );
 }
 fn configured_output(bus: &mut impl Registers, port: Port, pin: u8, level: Level) {
-    function(bus, port, pin, 0);
-    modify(bus, pcr(port, pin), 0x8000, 0);
+    function(bus, port, pin, GPIO_FUNCTION);
+    modify(bus, pcr(port, pin), PCR_DDIS, 0);
     high_drive(bus, port, pin, level, false);
 }
 fn direction(bus: &mut impl Registers, port: Port, pin: u8, output: bool) {
@@ -117,7 +189,7 @@ fn direction(bus: &mut impl Registers, port: Port, pin: u8, output: bool) {
 }
 fn write_level(bus: &mut impl Registers, port: Port, pin: u8, level: Level) {
     bus.write(
-        port_register(port, if level == Level::High { 8 } else { 10 }),
+        port_register(port, if level == Level::High { POSR } else { PORR }),
         1 << pin,
     );
 }
@@ -125,14 +197,14 @@ fn write_level(bus: &mut impl Registers, port: Port, pin: u8, level: Level) {
 /// Read-only whole-port diagnostic snapshot; does not claim/reconfigure pins.
 /// D/E registers can be read even on packages without those pins bonded out.
 pub fn read_port(port: Port) -> u16 {
-    Mmio.read(port_register(port, 0))
+    Mmio.read(port_register(port, PIDR))
 }
 
 /// Release JTAG-only functions (PSPCR bits2..4), retaining SWD bits0..1.
 /// # Safety
 /// Caller must own the debug-pin configuration; this does not disable SWD.
 pub unsafe fn release_jtag() {
-    protected(&mut Mmio, |bus| modify(bus, PSPCR, 0x1c, 0));
+    protected(&mut Mmio, |bus| modify(bus, PSPCR, JTAG_FUNCTIONS, 0));
 }
 
 pub struct InputPin {
@@ -206,7 +278,7 @@ impl OutputPin {
     }
     #[inline]
     pub fn toggle(&mut self) {
-        Mmio.write(port_register(self.port, 12), 1 << self.pin);
+        Mmio.write(port_register(self.port, POTR), 1 << self.pin);
     }
 }
 
@@ -255,8 +327,8 @@ fn alternate(bus: &mut impl Registers, port: Port, pin: u8, code: u8, mode: Alte
     function(bus, port, pin, code);
     match mode {
         AlternateMode::FunctionOnly => {}
-        AlternateMode::Digital => modify(bus, pcr(port, pin), 0x8000, 0),
-        AlternateMode::DigitalOutput => modify(bus, pcr(port, pin), 0x8001, 2),
+        AlternateMode::Digital => modify(bus, pcr(port, pin), PCR_DDIS, 0),
+        AlternateMode::DigitalOutput => modify(bus, pcr(port, pin), PCR_DDIS | PCR_POUT, PCR_POUTE),
     }
 }
 impl AlternatePin {
@@ -266,7 +338,7 @@ impl AlternatePin {
     /// valid for the pin. No automatic function-routing/electrical validation.
     pub unsafe fn new(port: Port, pin: u8, code: u8, mode: AlternateMode) -> Self {
         validate(port, pin);
-        assert!(code < 64);
+        assert!(u16::from(code) <= PFSR_FSEL);
         protected(&mut Mmio, |bus| alternate(bus, port, pin, code, mode));
         Self { port, pin }
     }
@@ -289,8 +361,8 @@ fn claim(bus: &mut impl Registers, port: Port, pin: u8, enable: bool) {
     for p in [Port::A, Port::B, Port::C, Port::H] {
         let present = match p {
             Port::A | Port::B => true,
-            Port::C => pin >= 13,
-            Port::H => pin <= 2,
+            Port::C => pin >= C_EXTI_FIRST_PIN,
+            Port::H => pin < H_PIN_COUNT,
             _ => false,
         };
         if !present {
@@ -315,7 +387,11 @@ fn claim(bus: &mut impl Registers, port: Port, pin: u8, enable: bool) {
 /// Enable before INTC registration (§2.4.2); unregister INTC before disabling.
 pub unsafe fn claim_external_interrupt(port: Port, pin: u8, enable: bool) {
     validate(port, pin);
-    assert!(matches!(port, Port::A | Port::B) || (port == Port::C && pin >= 13) || port == Port::H);
+    assert!(
+        matches!(port, Port::A | Port::B)
+            || (port == Port::C && pin >= C_EXTI_FIRST_PIN)
+            || port == Port::H
+    );
     claim(&mut Mmio, port, pin, enable);
 }
 /// Existing EXTI pull-up sequence and competing-channel cleanup, protected.
@@ -324,7 +400,11 @@ pub unsafe fn claim_external_interrupt(port: Port, pin: u8, enable: bool) {
 /// channel cleanup scope is the same as `claim_external_interrupt`.
 pub(crate) unsafe fn configure_exti_input(port: Port, pin: u8) {
     validate(port, pin);
-    assert!(matches!(port, Port::A | Port::B) || (port == Port::C && pin >= 13) || port == Port::H);
+    assert!(
+        matches!(port, Port::A | Port::B)
+            || (port == Port::C && pin >= C_EXTI_FIRST_PIN)
+            || port == Port::H
+    );
     protected(&mut Mmio, |bus| {
         pull_up(bus, port, pin, true);
         claim(bus, port, pin, true);
