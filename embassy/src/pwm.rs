@@ -14,16 +14,29 @@ use crate::pac;
 
 // HC32F460 PWC FCG2 register controlling the TimerA clocks.
 const CLOCK_GATE: usize = 0x4004_8008;
+// Vendor SVD / RM 21.5.1: TimerA counter register byte offset.
 const CNTER: usize = 0x00;
+// Vendor SVD / RM 21.5.2: TimerA period register byte offset.
 const PERAR: usize = 0x04;
+// Vendor SVD / RM 21.5.3: first channel's comparison register byte offset.
 const CMPAR: usize = 0x40;
+// Vendor SVD / RM 21.5.4: TimerA control/status register byte offset.
 const BCSTR: usize = 0x80;
+// Vendor SVD: first channel's output-control register byte offset.
 const PCONR: usize = 0x140;
+// Vendor SVD: PWC FCG2.TIMERA_4 (bit 5) disables TimerA4's clock when set.
 const CLOCK_BIT: u32 = 1 << 5;
-// Preserve the owner-confirmed setup: OUTEN, invert at compare, high at period,
-// high-at-start request (ineffective with /256 per errata §3.3.2).
+// Vendor SVD: TimerA provides eight comparison/output channels, numbered 1..=8.
+const CHANNEL_COUNT: u8 = 8;
+// Vendor SVD: successive CMPAR/PCONR channel registers are spaced four bytes apart.
+const CHANNEL_STRIDE: usize = 4;
+// Interior duty cycles require 0 < compare < period; the smallest valid period is 2.
+const MIN_PERIOD: u16 = 2;
+// RM 21.5 PCONR: OUTEN=1, CMPC=0b11 (invert), PERC=0b01 (high),
+// STAC=0b01 (high at start), STPC=0b00, FORC=0b00. Preserve the original
+// setup; the start-level request is ineffective with /256 per errata §3.3.2.
 const OUTPUT: u16 = 0x1071;
-// CKDIV=8 (/256), DIR=1 (up), MODE=0 (sawtooth), START=1.
+// RM 21.5.4 BCSTR: CKDIV=8 (/256), DIR=1 (up), MODE=0 (sawtooth), START=1.
 const RUN: u16 = 0x0083;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +80,9 @@ fn enable_clock(bus: &mut impl Registers) {
 }
 
 fn check_config(channel: u8, period: u16) -> Result<(), Error> {
-    if !(1..=8).contains(&channel) {
+    if !(1..=CHANNEL_COUNT).contains(&channel) {
         Err(Error::InvalidChannel)
-    } else if period < 2 {
+    } else if period < MIN_PERIOD {
         Err(Error::InvalidPeriod)
     } else {
         Ok(())
@@ -91,7 +104,7 @@ fn set_compare(
     compare: u16,
 ) -> Result<(), Error> {
     check_compare(period, compare)?;
-    bus.write_timer(CMPAR + 4 * usize::from(channel - 1), compare);
+    bus.write_timer(CMPAR + CHANNEL_STRIDE * usize::from(channel - 1), compare);
     Ok(())
 }
 
@@ -100,8 +113,8 @@ fn start(bus: &mut impl Registers, channel: u8, period: u16, compare: u16) -> Re
     let index = usize::from(channel - 1);
     bus.write_timer(CNTER, 0);
     bus.write_timer(PERAR, period);
-    bus.write_timer(PCONR + 4 * index, OUTPUT);
-    bus.write_timer(CMPAR + 4 * index, compare);
+    bus.write_timer(PCONR + CHANNEL_STRIDE * index, OUTPUT);
+    bus.write_timer(CMPAR + CHANNEL_STRIDE * index, compare);
     bus.write_timer(BCSTR, RUN);
     Ok(())
 }
