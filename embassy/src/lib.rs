@@ -6,3 +6,4 @@ pub use hc32f460_pac as pac;
 
 pub mod clock_decode;
 pub mod clocks;
+pub mod intc;

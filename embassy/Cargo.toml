@@ -13,4 +13,6 @@ keywords = ["arm", "cortex-m", "hc32", "hal", "embassy"]
 targets = ["thumbv7em-none-eabihf"]
 
 [dependencies]
+cortex-m.workspace = true
+critical-section.workspace = true
 hc32f460-pac = { path = "../pac", default-features = false }
