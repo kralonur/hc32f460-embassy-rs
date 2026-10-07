@@ -16,14 +16,36 @@ pub const HRC_16MHZ: u32 = 16_000_000;
 pub const MRC_HZ: u32 = 8_000_000;
 /// Internal low-speed RC and the 32.768 kHz crystal share a nominal rate.
 pub const LRC_HZ: u32 = 32_768;
+/// Nominal external low-speed crystal frequency in Hz (RM 4.11.20).
 pub const XTAL32_HZ: u32 = 32_768;
 
 /// Documented PLL input (PFD) range in Hz (RM section 4.11.15).
 pub const PLL_PFD_MIN_HZ: u32 = 1_000_000;
+/// Maximum documented PLL input (PFD) frequency in Hz (RM 4.11.15).
 pub const PLL_PFD_MAX_HZ: u32 = 25_000_000;
 /// Documented MPLL VCO range in Hz (RM section 4.11.15).
 pub const PLL_VCO_MIN_HZ: u32 = 240_000_000;
+/// Maximum documented MPLL VCO frequency in Hz (RM 4.11.15).
 pub const PLL_VCO_MAX_HZ: u32 = 480_000_000;
+
+// Vendor SVD: CKSW and each SCFGR divider selector occupy three bits.
+const SELECTOR_MASK: u32 = 0b111;
+// Vendor SVD: PLLCFGR.MPLLM occupies bits 4:0.
+const PLL_M_MASK: u32 = 0x1f;
+// Vendor SVD: PLLCFGR.PLLSRC (bit 7) selects HRC rather than XTAL.
+const PLL_SOURCE_HRC: u32 = 1 << 7;
+// Vendor SVD: PLLCFGR.MPLLN begins at bit 8.
+const PLL_N_SHIFT: u32 = 8;
+// Vendor SVD: PLLCFGR.MPLLN is nine bits wide.
+const PLL_N_MASK: u32 = 0x1ff;
+// Vendor SVD: PLLCFGR.MPLLP begins at bit 28.
+const PLL_P_SHIFT: u32 = 28;
+// Vendor SVD: PLLCFGR.MPLLP is four bits wide.
+const PLL_P_MASK: u32 = 0xf;
+// Vendor SVD: SCFGR.HCLKS occupies bits 26:24.
+const HCLK_SHIFT: u32 = 24;
+// Vendor SVD: SCFGR PCLK0S..PCLK4S start at these bit positions, in clock order.
+const PCLK_SHIFTS: [u32; 5] = [0, 4, 8, 12, 16];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockError {
@@ -36,7 +58,8 @@ pub enum ClockError {
 }
 
 impl ClockError {
-    /// Compact code for the on-target status record (0 means no error).
+    /// Legacy on-target status code: 1 = source, 2 = divider, 3 = PLL divider.
+    /// Zero is reserved for no error; preserve these values for existing consumers.
     pub fn code(self) -> u8 {
         match self {
             ClockError::ProhibitedSource(_) => 1,
@@ -82,7 +105,7 @@ pub struct ClockState {
 }
 
 pub fn source_from_cksw(cksw: u32) -> Result<Source, ClockError> {
-    match cksw & 0x7 {
+    match cksw & SELECTOR_MASK {
         0 => Ok(Source::Hrc),
         1 => Ok(Source::Mrc),
         2 => Ok(Source::Lrc),
@@ -95,7 +118,7 @@ pub fn source_from_cksw(cksw: u32) -> Result<Source, ClockError> {
 
 /// `CMU_SCFGR` divider selector: `000`..`110` mean divide by 1, 2, 4, 8, 16, 32, 64.
 pub fn divide_from_scfgr(field: u32) -> Result<u32, ClockError> {
-    match field & 0x7 {
+    match field & SELECTOR_MASK {
         0 => Ok(1),
         1 => Ok(2),
         2 => Ok(4),
@@ -109,14 +132,14 @@ pub fn divide_from_scfgr(field: u32) -> Result<u32, ClockError> {
 
 /// Decode `CMU_PLLCFGR` (0x40054100) into true factors.
 pub fn pll_from_pllcfgr(raw: u32) -> Result<Pll, ClockError> {
-    let p_field = (raw >> 28) & 0xf;
+    let p_field = (raw >> PLL_P_SHIFT) & PLL_P_MASK;
     if p_field == 0 {
         return Err(ClockError::ProhibitedPllDivider);
     }
     Ok(Pll {
-        source_hrc: (raw >> 7) & 1 != 0,
-        m: (raw & 0x1f) + 1,
-        n: ((raw >> 8) & 0x1ff) + 1,
+        source_hrc: raw & PLL_SOURCE_HRC != 0,
+        m: (raw & PLL_M_MASK) + 1,
+        n: ((raw >> PLL_N_SHIFT) & PLL_N_MASK) + 1,
         p: p_field + 1,
     })
 }
@@ -150,10 +173,10 @@ pub fn state_from_registers(
             vco / pll.p
         }
     };
-    let hclk_hz = system_hz / divide_from_scfgr((scfgr_raw >> 24) & 0x7)?;
-    let mut pclk_hz = [0u32; 5];
-    for (index, shift) in [0u32, 4, 8, 12, 16].into_iter().enumerate() {
-        pclk_hz[index] = system_hz / divide_from_scfgr((scfgr_raw >> shift) & 0x7)?;
+    let hclk_hz = system_hz / divide_from_scfgr((scfgr_raw >> HCLK_SHIFT) & SELECTOR_MASK)?;
+    let mut pclk_hz = [0u32; PCLK_SHIFTS.len()];
+    for (index, shift) in PCLK_SHIFTS.into_iter().enumerate() {
+        pclk_hz[index] = system_hz / divide_from_scfgr((scfgr_raw >> shift) & SELECTOR_MASK)?;
     }
     Ok(ClockState {
         source,

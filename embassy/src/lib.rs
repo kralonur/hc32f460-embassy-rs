@@ -26,15 +26,17 @@ pub mod time_driver;
 /// Call once at startup, before other drivers run. The caller must exclusively
 /// own SysTick and supply the configured CPU clock in `clocks.sys_clk`.
 pub unsafe fn init(clocks: clocks::Clocks) {
-    // Embassy time uses 1,000 ticks per second, selected in the HAL manifest.
+    // The time driver advances one millisecond per interrupt; match tick-hz-1_000.
     const TICK_HZ: u32 = 1_000;
-    // ARM Cortex-M4 SysTick has a 24-bit reload register.
+    // The ARMv7-M 24-bit reload stores ticks minus one, allowing 2^24 CPU cycles.
     const MAX_TICKS: u32 = 1 << 24;
-    // ARM Cortex-M4 core peripheral map: reload, current value, and control registers.
+    // ARMv7-M fixes these core-private addresses; the vendor PAC does not model SysTick.
     const RELOAD: usize = 0xE000_E014;
+    // Writing CURRENT also clears COUNTFLAG, discarding any inherited tick state.
     const CURRENT: usize = 0xE000_E018;
+    // Enable only after reload and counter setup, preventing a premature tick.
     const CONTROL: usize = 0xE000_E010;
-    // ARM SysTick CTRL: enable counter, enable interrupt, select CPU clock.
+    // ENABLE/TICKINT/CLKSOURCE must all be set for CPU-clocked interrupt ticks.
     const ENABLE: u32 = 0b111;
 
     assert!(
