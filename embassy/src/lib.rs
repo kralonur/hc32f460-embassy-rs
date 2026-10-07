@@ -8,6 +8,7 @@ pub mod clock_decode;
 pub mod clocks;
 pub mod exti;
 pub mod gpio;
+pub mod i2c;
 pub mod intc;
 pub mod pwm;
 pub mod time_driver;

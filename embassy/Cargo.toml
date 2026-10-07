@@ -12,12 +12,18 @@ keywords = ["arm", "cortex-m", "hc32", "hal", "embassy"]
 [package.metadata.docs.rs]
 targets = ["thumbv7em-none-eabihf"]
 
+[features]
+# Bring-up diagnostic only; default builds use interrupt-driven receive waits.
+i2c-rx-poll-diagnostic = []
+
 [dependencies]
 cortex-m.workspace = true
 critical-section.workspace = true
+embassy-futures.workspace = true
 embassy-sync.workspace = true
 embassy-time = { workspace = true, features = ["tick-hz-1_000"] }
 embassy-time-driver.workspace = true
 embassy-time-queue-utils = { workspace = true, features = ["generic-queue-16"] }
 embedded-hal.workspace = true
+embedded-hal-async.workspace = true
 hc32f460-pac = { path = "../pac", default-features = false }
