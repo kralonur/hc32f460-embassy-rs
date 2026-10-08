@@ -27,3 +27,4 @@ embassy-time-queue-utils = { workspace = true, features = ["generic-queue-16"] }
 embedded-hal.workspace = true
 embedded-hal-async.workspace = true
 hc32f460-pac = { path = "../pac", default-features = false }
+thiserror = { workspace = true, default-features = false }

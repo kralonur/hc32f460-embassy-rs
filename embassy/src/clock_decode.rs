@@ -29,23 +29,36 @@ pub const PLL_VCO_MIN_HZ: u32 = 240_000_000;
 pub const PLL_VCO_MAX_HZ: u32 = 480_000_000;
 
 // Vendor SVD: CKSW and each SCFGR divider selector occupy three bits.
-const SELECTOR_MASK: u32 = 0b111;
+pub(crate) const SELECTOR_MASK: u32 = 0b111;
 // Vendor SVD: PLLCFGR.MPLLM occupies bits 4:0.
-const PLL_M_MASK: u32 = 0x1f;
+pub(crate) const PLL_M_MASK: u32 = 0x1f;
 // Vendor SVD: PLLCFGR.PLLSRC (bit 7) selects HRC rather than XTAL.
-const PLL_SOURCE_HRC: u32 = 1 << 7;
+pub(crate) const PLL_SOURCE_HRC: u32 = 1 << 7;
 // Vendor SVD: PLLCFGR.MPLLN begins at bit 8.
-const PLL_N_SHIFT: u32 = 8;
+pub(crate) const PLL_N_SHIFT: u32 = 8;
 // Vendor SVD: PLLCFGR.MPLLN is nine bits wide.
-const PLL_N_MASK: u32 = 0x1ff;
+pub(crate) const PLL_N_MASK: u32 = 0x1ff;
 // Vendor SVD: PLLCFGR.MPLLP begins at bit 28.
-const PLL_P_SHIFT: u32 = 28;
+pub(crate) const PLL_P_SHIFT: u32 = 28;
 // Vendor SVD: PLLCFGR.MPLLP is four bits wide.
-const PLL_P_MASK: u32 = 0xf;
+pub(crate) const PLL_P_MASK: u32 = 0xf;
 // Vendor SVD: SCFGR.HCLKS occupies bits 26:24.
-const HCLK_SHIFT: u32 = 24;
+pub(crate) const HCLK_SHIFT: u32 = 24;
 // Vendor SVD: SCFGR PCLK0S..PCLK4S start at these bit positions, in clock order.
-const PCLK_SHIFTS: [u32; 5] = [0, 4, 8, 12, 16];
+pub(crate) const PCLK_SHIFTS: [u32; 5] = [0, 4, 8, 12, 16];
+// RM 4.11.15: MPLLQ and MPLLR are four-bit output dividers like MPLLP.
+pub(crate) const PLL_Q_SHIFT: u32 = 24;
+// RM 4.11.15: MPLLR begins at bit 20.
+pub(crate) const PLL_R_SHIFT: u32 = 20;
+// RM 4.11.21: external-bus divider EXCKS starts at bit 20.
+pub(crate) const EXCLK_SHIFT: u32 = 20;
+// RM 4.11.15: writable MPLL factors and the shared input-source selector.
+pub(crate) const PLL_CONFIG_MASK: u32 = (PLL_P_MASK << PLL_P_SHIFT)
+    | (PLL_P_MASK << PLL_Q_SHIFT)
+    | (PLL_P_MASK << PLL_R_SHIFT)
+    | (PLL_N_MASK << PLL_N_SHIFT)
+    | PLL_M_MASK
+    | PLL_SOURCE_HRC;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockError {
@@ -187,11 +200,11 @@ pub fn state_from_registers(
     })
 }
 
-/// HRC frequency from the readback bit the stock application uses at `0x24648`.
+/// Nominal HRC frequency from the vendor DDL's frequency-monitor selector.
 ///
-/// The reference manual documents `ICG1.HRCFREQSEL` (`0` = 20 MHz, `1` = 16 MHz) but
-/// not this readback address, so the mapping is inferred from stock behaviour and
-/// recorded as an assumption rather than a documented fact.
+/// RM 6.2.2 documents `ICG1.HRCFREQSEL` (`0` = 20 MHz, `1` = 16 MHz).
+/// DDL Rev3.3.0 `system_hc32f460.c::SystemCoreClockUpdate` uses the same
+/// mapping for `HRC_FREQ_MON()`. Vendor reference links are in [`crate::clocks`].
 pub fn hrc_hz_from_readback_bit(bit: bool) -> u32 {
     if bit { HRC_16MHZ } else { HRC_20MHZ }
 }

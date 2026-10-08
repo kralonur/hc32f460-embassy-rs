@@ -24,7 +24,7 @@ pub mod time_driver;
 ///
 /// # Safety
 /// Call once at startup, before other drivers run. The caller must exclusively
-/// own SysTick and supply the configured CPU clock in `clocks.sys_clk`.
+/// own SysTick and supply the configured CPU clock in `clocks.hclk`.
 pub unsafe fn init(clocks: clocks::Clocks) {
     // The time driver advances one millisecond per interrupt; match tick-hz-1_000.
     const TICK_HZ: u32 = 1_000;
@@ -40,10 +40,10 @@ pub unsafe fn init(clocks: clocks::Clocks) {
     const ENABLE: u32 = 0b111;
 
     assert!(
-        clocks.sys_clk >= TICK_HZ && clocks.sys_clk / TICK_HZ <= MAX_TICKS,
+        clocks.hclk >= TICK_HZ && clocks.hclk / TICK_HZ <= MAX_TICKS,
         "CPU clock must support a 1 kHz SysTick within its 24-bit reload range"
     );
-    let reload = clocks.sys_clk / TICK_HZ - 1;
+    let reload = clocks.hclk / TICK_HZ - 1;
     // SAFETY: These are word-aligned SysTick registers. The caller owns the timer,
     // and the checked reload fits its register. Setup precedes enabling interrupts.
     unsafe {
