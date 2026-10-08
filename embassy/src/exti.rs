@@ -6,7 +6,7 @@
 //! interrupt handler calls [`on_interrupt`], which clears the `EIFR` flag and
 //! wakes the task waiting on that channel.
 //!
-//! Enable order follows Errata Rev 1.41 §2.4.2 (peripheral side first, then
+//! Enable order follows Errata §2.4.2 (peripheral side first, then
 //! claim the line, clear pending, enable NVIC); [`ExtiInput::new`] only does the
 //! peripheral side, so call [`crate::intc::register`] afterwards.
 //!
@@ -83,7 +83,11 @@ impl ExtiInput {
     /// Configure `pin` on `port` as an external-interrupt input with a pull-up.
     ///
     /// # Safety
-    /// The caller must own the pin and must register the channel afterwards:
+    /// The caller must own the pin and its channel across all competing ports,
+    /// with the channel's NVIC routes disabled before changing PCR.INTE
+    /// (Errata 2.4.2). XTAL32 must already be stopped for PC14/PC15; PC15 input
+    /// requires the reset-time workaround in Errata 2.6.1.
+    /// Register the channel afterwards:
     /// `intc::register(pin as u16, Line::new(<line>)…, prio)`.
     pub unsafe fn new(port: crate::gpio::Port, pin: u8, trigger: crate::intc::EirqTrigger) -> Self {
         // SAFETY: The caller exclusively owns this pin and its external-interrupt channel.
@@ -94,7 +98,8 @@ impl ExtiInput {
 
     /// Consume an already-owned input pin and configure its EXTI channel.
     /// # Safety
-    /// Caller owns the channel and must register INTC after this call.
+    /// Caller must meet the channel, NVIC and oscillator requirements of
+    /// [`Self::new`] and register INTC after this call.
     pub unsafe fn from_input(
         input: crate::gpio::InputPin,
         trigger: crate::intc::EirqTrigger,

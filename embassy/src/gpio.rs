@@ -2,6 +2,15 @@
 //! allocation is caller-enforced: one owner per pin, no Clone, no drop-time
 //! hardware changes. Configuration unlock/RMW/relock is synchronous and guarded
 //! by a critical section; output set/reset/toggle use 16-bit write-one aliases.
+//!
+//! All digital-pin constructors require the caller to stop XTAL32 before using
+//! PC14/PC15 (RM-ZH 9.4.12). For PC15 input/open-drain use, Errata 2.6.1 requires
+//! this at the start of Reset_Handler, not merely when constructing a pin.
+//! This module does not own the shared oscillator and cannot stop it implicitly.
+//! Debug functions must also be released before using their pins as GPIO or
+//! alternate functions (RM 9.4.12). Legacy `InputPin::new`/`OutputPin::new` only
+//! change direction/level: the caller must already have selected GPIO and
+//! enabled digital functions; they do not override the inherited mux/DDIS.
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Port {
@@ -60,7 +69,7 @@ const PFSR_OFFSET: usize = 2;
 const PINS_PER_PORT: u8 = 16;
 // Vendor SVD: port H exposes PH0, PH1, and PH2.
 const H_PIN_COUNT: u8 = 3;
-// Original JEUA EXTI cleanup scope includes PC13..15, not every port C pin.
+// The public EXTI API selects PC13..15 on JEUA; cleanup still covers all ports.
 const C_EXTI_FIRST_PIN: u8 = 13;
 // RM 9.4.10: WP=0xA5 in bits 15:8 supplies the key, WE=0 disables writes.
 const PWPR_LOCK: u16 = 0xa500;
@@ -143,12 +152,18 @@ fn protected<R: Registers, T>(bus: &mut R, f: impl FnOnce(&mut R) -> T) -> T {
 }
 fn function(bus: &mut impl Registers, port: Port, pin: u8, code: u8) {
     assert!(u16::from(code) <= PFSR_FSEL);
+    // RM 9.4.11 / RM-ZH 9.5: latch output across function selection, then
+    // restore the caller's latch state. Do not expose the intermediate mux.
+    let control = pcr(port, pin);
+    let latch = bus.read(control) & PCR_LTE;
+    modify(bus, control, 0, PCR_LTE);
     modify(
         bus,
         pcr(port, pin) + PFSR_OFFSET,
         PFSR_FSEL | PFSR_BFE,
         u16::from(code),
     );
+    modify(bus, control, PCR_LTE, latch);
 }
 fn pull_up(bus: &mut impl Registers, port: Port, pin: u8, exti: bool) {
     function(bus, port, pin, GPIO_FUNCTION);
@@ -336,6 +351,8 @@ impl AlternatePin {
     /// # Safety
     /// Caller owns this bonded pin; function/code and peripheral setup must be
     /// valid for the pin. No automatic function-routing/electrical validation.
+    /// For PC14/PC15, stop the external low-speed oscillator before enabling
+    /// digital functions (RM-ZH 9.4.12); this constructor does not stop it.
     pub unsafe fn new(port: Port, pin: u8, code: u8, mode: AlternateMode) -> Self {
         validate(port, pin);
         assert!(u16::from(code) <= PFSR_FSEL);
@@ -357,15 +374,10 @@ impl AlternatePin {
 }
 
 fn claim(bus: &mut impl Registers, port: Port, pin: u8, enable: bool) {
-    // Preserve the JEUA cleanup set used by the existing EXTI driver.
-    for p in [Port::A, Port::B, Port::C, Port::H] {
-        let present = match p {
-            Port::A | Port::B => true,
-            Port::C => pin >= C_EXTI_FIRST_PIN,
-            Port::H => pin < H_PIN_COUNT,
-            _ => false,
-        };
-        if !present {
+    // Errata 2.4.1 applies to every port sharing this channel, including pins
+    // left configured by a bootloader outside the selected JEUA pin subset.
+    for p in [Port::A, Port::B, Port::C, Port::D, Port::E, Port::H] {
+        if p == Port::H && pin >= H_PIN_COUNT {
             continue;
         }
         let address = pcr(p, pin);
@@ -382,9 +394,10 @@ fn claim(bus: &mut impl Registers, port: Port, pin: u8, enable: bool) {
 }
 /// Errata §2.4.1: clear competing INTE flags, then claim the selected channel.
 /// # Safety
-/// Caller owns the channel/pin and has PWPR unlocked. JEUA cleanup covers A/B,
-/// C13..15, H0..2 as before; D/E EXTI ownership is not supported by this helper.
-/// Enable before INTC registration (§2.4.2); unregister INTC before disabling.
+/// Caller owns the channel across all competing ports and has PWPR unlocked.
+/// Selected pins are limited to A/B, C13..15 and H0..2; cleanup covers all ports.
+/// NVIC routes for this channel must be disabled while changing INTE (Errata
+/// 2.4.2). Enable before INTC registration; unregister INTC before disabling.
 pub unsafe fn claim_external_interrupt(port: Port, pin: u8, enable: bool) {
     validate(port, pin);
     assert!(
@@ -396,8 +409,9 @@ pub unsafe fn claim_external_interrupt(port: Port, pin: u8, enable: bool) {
 }
 /// Existing EXTI pull-up sequence and competing-channel cleanup, protected.
 /// # Safety
-/// Caller exclusively owns the pin/channel; register INTC afterwards. JEUA
-/// channel cleanup scope is the same as `claim_external_interrupt`.
+/// Caller exclusively owns the pin/channel across all competing ports, with
+/// its NVIC routes disabled; register INTC afterwards. XTAL32 must already be
+/// stopped for PC14/PC15.
 pub(crate) unsafe fn configure_exti_input(port: Port, pin: u8) {
     validate(port, pin);
     assert!(
@@ -410,3 +424,6 @@ pub(crate) unsafe fn configure_exti_input(port: Port, pin: u8) {
         claim(bus, port, pin, true);
     });
 }
+
+#[cfg(test)]
+mod tests;

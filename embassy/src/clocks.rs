@@ -1,15 +1,9 @@
 //! HRC/MPLL startup and nominal clock frequencies for peripheral drivers.
 //!
-//! Register definitions and limits follow [RM] Rev1.5 sections 4.4, 4.7,
-//! 4.8, 4.11 and 7.4. The additional divider relationship follows the Chinese
-//! [RM171] section 4.4; reserved SCFGR bits follow [errata] Rev1.41 section 2.1.4.
-//! HRC detection and clock switching are cross-checked against [DDL] Rev3.3.0,
+//! Register definitions follow RM 4.7, 4.8, 4.11 and 7.4; clock constraints
+//! follow RM-ZH 4.4, and reserved SCFGR bits follow Errata 2.1.4.
+//! HRC detection and clock switching are cross-checked against DDL
 //! `system_hc32f460.c` and `hc32_ll_clk.c`. No vendor code is embedded here.
-//!
-//! [RM]: https://oss-nc-beijing-2.cecloudcs.com/doc-rm/RM_HC32F460_F45x_A460SeriesReferenceManual_Rev1.5.pdf
-//! [RM171]: https://oss-nc-beijing-2.cecloudcs.com/doc-rm/RM_HC32F460_F45x_A460系列参考手册_Rev1.71.pdf
-//! [errata]: https://oss-nc-beijing-2.cecloudcs.com/doc-es/ES_HC32F460_F451_F452_A460系列勘误表_Rev1.41.pdf
-//! [DDL]: https://oss-nc-beijing-2.cecloudcs.com/doc-hc/HC32F460_DDL_Rev3.3.0.zip
 
 use crate::clock_decode as decode;
 
@@ -93,8 +87,7 @@ impl Mpll {
         multiplier: u16,
         output_dividers: [u8; 3],
     ) -> Result<Self, Error> {
-        // RM 4.11.15: M=1..32, N=20..480 and P/Q/R=2..16, stored minus one.
-        const INPUT_MAX: u8 = 32;
+        // RM 4.11.15: M=1..24, N=20..480 and P/Q/R=2..16, stored minus one.
         // RM 4.11.15: minimum permitted VCO multiplication factor.
         const MULTIPLIER_MIN: u16 = 20;
         // RM 4.11.15: maximum permitted VCO multiplication factor.
@@ -103,7 +96,7 @@ impl Mpll {
         const OUTPUT_MIN: u8 = 2;
         // RM 4.11.15: four-bit output encoding permits a true factor of sixteen.
         const OUTPUT_MAX: u8 = 16;
-        if !(1..=INPUT_MAX).contains(&input_divider)
+        if !(1..=decode::PLL_INPUT_MAX_FACTOR).contains(&input_divider)
             || !(MULTIPLIER_MIN..=MULTIPLIER_MAX).contains(&multiplier)
             || output_dividers
                 .iter()
@@ -139,8 +132,8 @@ pub struct Config {
 
 // RM 4.4, 4.7: maximum SYSCLK/HCLK and PCLK0 frequency, in Hz.
 const MAX_SYSTEM_HZ: u32 = 200_000_000;
-// RM 4.4 Table 4-1: maximum PCLK0..4 frequencies in Hz. ADC analog supply
-// constraints can impose a lower conversion-clock limit (DS Rev1.61 Table 3-37).
+// RM Table 4-1: maximum PCLK0..4 frequencies in Hz. ADC analog supply
+// constraints can impose a lower conversion-clock limit (DS Table 3-37).
 const MAX_PCLK_HZ: [u32; 5] = [
     200_000_000,
     100_000_000,
@@ -152,7 +145,7 @@ const MAX_PCLK_HZ: [u32; 5] = [
 const MAX_EXCLK_HZ: u32 = 100_000_000;
 // RM 4.4: HCLK:EXCLK must be 2, 4, 8, 16 or 32; compare selector differences.
 const MAX_EXCLK_DIVIDER_DELTA: u8 = 5;
-// RM171 4.4: PCLK2:PCLK4 must be 1:4, 1:2, 1:1, 2:1, 4:1 or 8:1.
+// RM-ZH 4.4: PCLK2:PCLK4 must be 1:4, 1:2, 1:1, 2:1, 4:1 or 8:1.
 const MIN_ADC_DIVIDER_DELTA: i8 = -2;
 // Largest allowed log2(PCLK2/PCLK4) from the same relationship.
 const MAX_ADC_DIVIDER_DELTA: i8 = 3;

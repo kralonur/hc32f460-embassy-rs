@@ -1,6 +1,6 @@
 //! Async I2C3 master for HC32F460.
 //!
-//! Receive ordering follows official DDL Rev 3.3.0
+//! Receive ordering follows DDL
 //! `I2C_MasterReceiveDataAndStop` with fast ACK disabled. Instead of spinning
 //! on `SR`, every step awaits a wakeup
 //! from the I2C3 interrupt handlers, which the application routes through
@@ -9,7 +9,7 @@
 //!
 //! The transaction sequence is separate from the hardware register access.
 //!
-//! Register facts (RM Rev 1.5 §26.5, vendor CMSIS header):
+//! Register facts (RM §26.5, vendor CMSIS header):
 //! `CR1` `PE=0x1`, **`RESTART=0x80`**, `START=0x100`, `STOP=0x200`,
 //! `ACK=0x400` (writing it sends NACK);
 //! status flags and their interrupt enables share bit positions — `STARTF/E` 0,
@@ -18,11 +18,13 @@
 //! bit 3, not bit 8: an early version armed bit 8, so the transfer-end wake
 //! never fired and every async transaction ran into its timeout.)
 //!
-//! Errata Rev 1.41 §4.1.1 is implemented as both of its steps: `CR4.BUSWAIT` is
+//! Errata §4.1.1 is implemented as both of its steps: `CR4.BUSWAIT` is
 //! set, **and** the last received byte is preceded by `CR1.STOP` (see
 //! [`I2c3::read_register`]). An earlier revision of this driver used the first step
 //! only, reasoning that the owner-confirmed polled sequence does the same — the
-//! vendor text requires both steps. STOP ordering alone did not resolve the
+//! vendor text requires both steps. Read-to-write repeated starts are rejected
+//! before I/O because the documented workaround requires STOP after a read.
+//! STOP ordering alone did not resolve the
 //! owner-observed second-byte timeout; its cause is not yet hardware-proven.
 //!
 //! `i2c-rx-poll-diagnostic` temporarily replaces only the two RFULL waits with
@@ -57,6 +59,16 @@ const DTR: usize = 0x24;
 const DRR: usize = 0x28;
 // Vendor SVD: I2C clock-control register byte offset.
 const CCR: usize = 0x2c;
+// RM 26.5.5–26.5.6: slave address registers; this driver is master-only.
+const SLR0: usize = 0x10;
+const SLR1: usize = 0x14;
+// RM 26.5.14: digital/analog filter configuration register byte offset.
+const FLTR: usize = 0x30;
+// RM 26.5.5–26.5.6: bit 12 enables the corresponding slave address match.
+const SLAVE_ADDRESS_ENABLE: u32 = 1 << 12;
+// RM 26.5.14: bits 1:0 encode filter capacity minus one; bit 4 enables it.
+const DIGITAL_FILTER_WIDTH: u32 = 0b11;
+const DIGITAL_FILTER_ENABLE: u32 = 1 << 4;
 
 // RM 26.5.1: CR1.PE (bit 0) enables the I2C peripheral.
 const PE: u32 = 1 << 0;
@@ -84,6 +96,8 @@ const RESET_STATE: u32 = 1 << 15;
 const STARTUP_RESET: u32 = RESET_STATE | GENERAL_CALL;
 // Vendor SVD: CLR.STARTFCLR (bit 0) clears the accepted-start status flag.
 const STARTFCLR: u32 = 1 << 0;
+// RM 26.5.8: CLR.STOPFCLR (bit 4) clears the previous stop condition.
+const STOPFCLR: u32 = 1 << 4;
 
 // Status flags and their interrupt enables share bit positions (vendor CMSIS
 // header): STARTF/E 0, TENDF/E 3, STOPF/E 4, RFULLF/E 6, TEMPTYF/E 7,
@@ -129,7 +143,7 @@ const ERROR_INTERRUPTS: u32 = ERROR;
 /// operation ends, including on timeout).
 const WAKE_TX_EMPTY: u32 = TEMPTYIE | ERROR_INTERRUPTS;
 /// Wake for receive mode entry and data waits. TENDF is invalid after a read
-/// address (errata §4.1.2); the official IRQ example enables RXI instead.
+/// address (Errata §4.1.2); the official IRQ example enables RXI instead.
 const WAKE_RX_FULL: u32 = RFULLIE | ERROR_INTERRUPTS;
 /// Wake for a byte transfer ending.
 const WAKE_TEND: u32 = TENDIE | ERROR_INTERRUPTS;
@@ -154,15 +168,20 @@ const CCR_WIDTH_MASK: u32 = 0x1f;
 const MIN_WIDTH_SUM: u32 = 2;
 // Two five-bit widths can represent at most 31 + 31 reference-clock ticks.
 const MAX_WIDTH_SUM: u32 = 2 * CCR_WIDTH_MASK;
-// RM 26.5.13 plus the inherited one-cycle filter: 2 * (3 + 1) ticks at FREQ=0.
-const FULL_RATE_OVERHEAD: u32 = 8;
-// RM 26.5.13 plus the inherited one-cycle filter: 2 * (2 + 1) ticks at FREQ=1.
-const HALF_RATE_OVERHEAD: u32 = 6;
-// RM 26.5.13: CCR.FREQ=1 divides PCLK3 by two.
-const HALF_RATE_DIVISOR: u32 = 2;
+// RM-ZH 26.5.13 with one-cycle filtering: each SCL phase adds 3+1 ticks
+// at CKDIV=0, or 2+1 ticks at CKDIV=1. Tuple fields are (divider, phase overhead).
+const CLOCK_DIVIDERS: [(u32, u32); 2] = [(1, 4), (2, 3)];
+// DS Table 3-24: standard/fast-mode maximum bus frequencies, in Hz.
+const STANDARD_MAX_HZ: u32 = 100_000;
+const FAST_MAX_HZ: u32 = 400_000;
+// DS Table 3-24: minimum SCL low/high periods, in nanoseconds.
+const STANDARD_PHASE_NS: (u64, u64) = (4_700, 4_000);
+const FAST_PHASE_NS: (u64, u64) = (1_300, 600);
+// SI conversion for frequency (Hz) times phase duration (ns).
+const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
 // Vendor SVD: CCR.SHIGHW occupies bits 12:8.
 const CCR_HIGH_SHIFT: u32 = 8;
-// Vendor SVD: CCR.FREQ occupies bits 18:16.
+// SVD: CCR.FREQ occupies bits 18:16; corrected name is CKDIV in RM-ZH 26.5.13.
 const CCR_FREQ_SHIFT: u32 = 16;
 
 // Legacy bring-up marker values; keep their numbering for application status records.
@@ -211,6 +230,9 @@ pub enum Error {
     NotReady,
     /// Address is outside the supported seven-bit range; no I/O performed.
     Address,
+    /// A read followed by a write needs a repeated start, but Errata 4.1.1
+    /// requires STOP at the end of master reception. No I/O is performed.
+    ReadRestart,
 }
 
 impl embedded_hal::i2c::Error for Error {
@@ -356,7 +378,9 @@ async fn begin(bus: &mut impl Registers) -> Result<(), Error> {
     // state reset with PE untouched, wait for BUSY to clear, start, then wait
     // for BUSY|STARTF.
     control(bus, 0, RESET_STATE);
-    control(bus, RESET_STATE | NACK, 0);
+    // RM 26.5.1: internal-state reset does not reset the CR1 configuration.
+    // Discard commands left pending by a cancelled/failed previous transaction.
+    control(bus, RESET_STATE | NACK | START | STOP | RESTART, 0);
     wait(bus, BUSY, 0, WAKE_TRANSFER, STEP_BUS_FREE).await?;
     control(bus, 0, START);
     wait(bus, BUSY | STARTF, BUSY | STARTF, WAKE_TRANSFER, STEP_START).await
@@ -374,8 +398,14 @@ async fn send(bus: &mut impl Registers, byte: u8) -> Result<(), Error> {
     }
 }
 
-async fn finish(bus: &mut impl Registers) -> Result<(), Error> {
+fn request_stop(bus: &mut impl Registers) {
+    // DDL I2C_Stop / I2C_MasterReceiveDataAndStop clear stale STOPF first.
+    bus.write(CLR, STOPFCLR);
     control(bus, 0, STOP);
+}
+
+async fn finish(bus: &mut impl Registers) -> Result<(), Error> {
+    request_stop(bus);
     wait(bus, STOPF, STOPF, WAKE_STOP, STEP_STOP).await
 }
 
@@ -404,6 +434,7 @@ fn request_restart(bus: &mut impl Registers) {
 
 /// One transaction, coalescing adjacent same-direction buffers. Empty reads
 /// are no-ops; an empty write still performs an address-only ACK probe.
+/// Read-to-write transitions are rejected before I/O (Errata 4.1.1).
 async fn transfer(
     bus: &mut impl Registers,
     addr7: u8,
@@ -411,6 +442,14 @@ async fn transfer(
 ) -> Result<(), Error> {
     if addr7 > MAX_ADDRESS {
         return Err(Error::Address);
+    }
+    let mut received = false;
+    for op in ops.iter().filter(|op| !empty_read(op)) {
+        if is_read(op) {
+            received = true;
+        } else if received {
+            return Err(Error::ReadRestart);
+        }
     }
     let Some(mut index) = ops.iter().position(|op| !empty_read(op)) else {
         return Ok(());
@@ -447,13 +486,13 @@ async fn transfer(
                 })
                 .sum();
             // Normal ACK flow pipelines one byte. A one-byte read needs NACK
-            // selected BEFORE the read address can start reception (RM26.5.3).
+            // selected BEFORE the read address can start reception (RM 26.5.3).
             if remaining == 1 {
                 control(bus, 0, NACK);
             }
             wait(bus, TEMPTYF, TEMPTYF, WAKE_TX_EMPTY, STEP_RX_ADDR_READY).await?;
             bus.transmit((addr7 << 1) | READ_DIRECTION);
-            // TENDF invalid in receive mode, errata4.1.2: retain RXI wake.
+            // TENDF invalid in receive mode, Errata 4.1.2: retain RXI wake.
             wait(bus, TRA, 0, WAKE_RX_FULL, STEP_RX_MODE).await?;
             if bus.read(SR) & ACKRF != 0 {
                 return Err(Error::Bus);
@@ -471,13 +510,9 @@ async fn transfer(
                             control(bus, 0, NACK);
                         }
                         if remaining == 1 {
-                            // BUSWAIT holds SCL. Request exit before final DRR:
-                            // STOP (errata4.1.1), or restart (RM26.3.1.5).
-                            if last_group {
-                                control(bus, 0, STOP);
-                            } else {
-                                request_restart(bus);
-                            }
+                            // Errata 4.1.1: STOP must precede the final DRR read.
+                            // Validation above ensures a read is the final group.
+                            request_stop(bus);
                         }
                         *byte = bus.receive();
                         remaining -= 1;
@@ -488,11 +523,7 @@ async fn transfer(
                     }
                 }
             }
-            if last_group {
-                return wait(bus, STOPF, STOPF, WAKE_STOP, STEP_STOP).await;
-            }
-            restarted(bus).await?;
-            control(bus, NACK, 0); // next write/read address must not inherit NACK
+            return wait(bus, STOPF, STOPF, WAKE_STOP, STEP_STOP).await;
         } else {
             send(bus, addr7 << 1).await?;
             progress += 1;
@@ -531,31 +562,68 @@ async fn bounded_transfer(
 }
 
 /// Baud-rate register value for the caller's requested bus speed.
-/// Uses CCR.FREQ=0 (PCLK3/1) when representable, otherwise FREQ=1 (PCLK3/2)
+/// Uses CCR.CKDIV=0 (PCLK3/1) when representable, otherwise CKDIV=1 (PCLK3/2)
 /// with a rounded-up period. Returns None when neither setting can represent it.
 ///
-/// The inherited timing model assumes an enabled one-cycle digital filter
-/// (the originating `firmware/hybrid/ina226.rs` implementation). The caller must
-/// maintain that filter configuration; this function does not configure it.
+/// RM 26.5.13: the timing model uses an enabled one-cycle digital filter,
+/// configured by the constructor. DS Table 3-24 supplies minimum low/high times;
+/// the requested frequency is an upper bound, not an exact-rate guarantee.
+/// Physical rise/fall times and pull-ups still require board validation.
 pub fn timing(pclk: u32, frequency: u32) -> Option<u32> {
-    let count = pclk
-        .checked_div(frequency)?
-        .checked_sub(FULL_RATE_OVERHEAD)?;
-    let (count, divider) = if (MIN_WIDTH_SUM..=MAX_WIDTH_SUM).contains(&count) {
-        (count, 0)
-    } else {
-        (
-            pclk.div_ceil(frequency.checked_mul(HALF_RATE_DIVISOR)?)
-                .checked_sub(HALF_RATE_OVERHEAD)?,
-            1,
-        )
-    };
-    if !(MIN_WIDTH_SUM..=MAX_WIDTH_SUM).contains(&count) {
+    if frequency == 0 || frequency > FAST_MAX_HZ {
         return None;
     }
-    let low = count / 2;
-    let high = count - low;
-    Some(low | (high << CCR_HIGH_SHIFT) | (divider << CCR_FREQ_SHIFT))
+    let (low_ns, high_ns) = if frequency <= STANDARD_MAX_HZ {
+        STANDARD_PHASE_NS
+    } else {
+        FAST_PHASE_NS
+    };
+    for (encoding, (divisor, overhead)) in CLOCK_DIVIDERS.into_iter().enumerate() {
+        let denominator = NANOSECONDS_PER_SECOND * u64::from(divisor);
+        let minimum_width = |ns: u64| {
+            (u64::from(pclk) * ns)
+                .div_ceil(denominator)
+                .saturating_sub(u64::from(overhead))
+                .max(1) as u32
+        };
+        let min_low = minimum_width(low_ns);
+        let min_high = minimum_width(high_ns);
+        let Some(count) = pclk.div_ceil(frequency * divisor).checked_sub(2 * overhead) else {
+            continue;
+        };
+        let low = (count / 2).max(min_low);
+        let high = count.saturating_sub(low).max(min_high);
+        if !(MIN_WIDTH_SUM..=MAX_WIDTH_SUM).contains(&(low + high))
+            || low > CCR_WIDTH_MASK
+            || high > CCR_WIDTH_MASK
+        {
+            continue;
+        }
+        return Some(low | (high << CCR_HIGH_SHIFT) | ((encoding as u32) << CCR_FREQ_SHIFT));
+    }
+    None
+}
+
+fn initialize(bus: &mut impl Registers, ccr: u32) {
+    bus.write(CR1, STARTUP_RESET);
+    control(bus, 0, PE);
+    // Keep reserved bits at their observed reset defaults (Errata 2.7.1).
+    let ccr_mask = CCR_WIDTH_MASK | (CCR_WIDTH_MASK << CCR_HIGH_SHIFT) | (0b111 << CCR_FREQ_SHIFT);
+    let value = bus.read(CCR);
+    bus.write(CCR, (value & !ccr_mask) | ccr);
+    let filter = bus.read(FLTR);
+    bus.write(
+        FLTR,
+        (filter & !DIGITAL_FILTER_WIDTH) | DIGITAL_FILTER_ENABLE,
+    );
+    for address in [SLR0, SLR1] {
+        let value = bus.read(address);
+        bus.write(address, value & !SLAVE_ADDRESS_ENABLE);
+    }
+    let cr4 = bus.read(CR4);
+    bus.write(CR4, cr4 | BUSWAIT);
+    bus.write(CR2, 0);
+    control(bus, STARTUP_RESET, 0);
 }
 
 struct Hardware;
@@ -591,8 +659,9 @@ impl I2c3 {
     /// The application owns any shared-bus mutex and the PCLK3 frequency.
     ///
     /// # Safety
-    /// Called once; the caller must route I2C3's events (428..431) and install
-    /// handlers that call [`on_interrupt`].
+    /// Called once with exclusive I2C3 ownership, configured I2C pins/pull-ups,
+    /// PWC write access and a valid PCLK3. Route events 428..431 and install
+    /// handlers that call [`on_interrupt`]. Slave operation is not supported.
     pub unsafe fn new(
         pclk3: u32,
         frequency: u32,
@@ -610,15 +679,7 @@ impl I2c3 {
         unsafe { gate.write_volatile(gate.read_volatile() & !CLOCK_BIT) };
 
         let mut bus = Hardware;
-        bus.write(CR1, STARTUP_RESET); // Assert SWRST/ENGC with PE=0, as before.
-        control(&mut bus, 0, PE);
-        bus.write(CCR, ccr);
-        control(&mut bus, STARTUP_RESET, 0);
-        control(&mut bus, 0, PE);
-        // Errata §4.1.1: hold SCL low rather than clocking ahead with DRR full.
-        let cr4 = bus.read(CR4);
-        bus.write(CR4, cr4 | BUSWAIT);
-        bus.write(CR2, 0); // waits arm their own source
+        initialize(&mut bus, ccr);
 
         Ok(Self { bus, _pins: pins })
     }
@@ -638,6 +699,7 @@ impl I2c3 {
 
     /// General seven-bit transaction; one 50ms bound for the whole operation.
     /// Empty reads are skipped; empty writes are address-only ACK probes.
+    /// Read-to-write repeated starts return [`Error::ReadRestart`] before I/O.
     /// Cancellation masks IRQ sources but does not guarantee STOP/recovery.
     pub async fn transaction(
         &mut self,
@@ -683,6 +745,9 @@ impl I2c3 {
 impl embedded_hal::i2c::ErrorType for I2c3 {
     type Error = Error;
 }
+
+#[cfg(test)]
+mod tests;
 
 impl embedded_hal_async::i2c::I2c for I2c3 {
     async fn transaction(

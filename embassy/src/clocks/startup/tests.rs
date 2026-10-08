@@ -162,6 +162,13 @@ fn both_hrc_rates_produce_checked_clocks_and_preserve_flash_latency() {
 #[test]
 fn invalid_profiles_are_refused_before_register_writes() {
     assert_eq!(Mpll::new(0, 30, [2; 3]).unwrap_err(), Error::PllFactors);
+    assert!(Mpll::new(24, 30, [2; 3]).is_ok());
+    for divider in 25..=32 {
+        assert_eq!(
+            Mpll::new(divider, 30, [2; 3]).unwrap_err(),
+            Error::PllFactors
+        );
+    }
     assert_eq!(Mpll::new(2, 19, [2; 3]).unwrap_err(), Error::PllFactors);
     assert_eq!(Mpll::new(2, 30, [1, 2, 2]).unwrap_err(), Error::PllFactors);
     let mut overclock = config();
@@ -173,7 +180,7 @@ fn invalid_profiles_are_refused_before_register_writes() {
         (bad_ratio, Error::BusClocks),
         (
             Config {
-                mpll: Mpll::new(32, 30, [2; 3]).unwrap(),
+                mpll: Mpll::new(24, 30, [2; 3]).unwrap(),
                 ..config()
             },
             Error::PllInput,
@@ -237,6 +244,24 @@ fn readiness_failures_are_bounded_and_relock_configuration() {
         assert!(io.polls <= POLL_BUDGET + 3);
         assert_eq!(io.get(FPRC) & u32::from(CMU_WRITE_ENABLE), 0);
     }
+}
+
+#[test]
+fn inherited_starting_mpll_is_not_stopped_before_it_stabilizes() {
+    let mut io = Io::new(false);
+    io.registers.insert(PLLCR, 0);
+    io.mpll_ready = false;
+    assert_eq!(
+        setup(&mut io, config()),
+        Err(Error::Timeout(Ready::MpllStable))
+    );
+    assert!(
+        !io.events
+            .iter()
+            .any(|event| matches!(event, Event::Write(PLLCR, _))),
+        "an unstable enabled MPLL must not receive a stop command"
+    );
+    assert_eq!(io.get(FPRC) & u32::from(CMU_WRITE_ENABLE), 0);
 }
 
 #[test]

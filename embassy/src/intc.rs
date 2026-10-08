@@ -2,11 +2,12 @@
 //!
 //! Semantics verified against three vendor sources, not against secondary code:
 //!
-//! * **RM Rev 1.5** §10.4.4, §10.5.5–10.5.12 and Table 10-2 (event/line routing);
+//! * **RM** §10.4.4, §10.5.5–10.5.12 and Table 10-2 (event/line routing);
+//!   RM-ZH 10.5.7 corrects the flag-clear register name to `EIFCR`;
 //! * **vendor SVD** `HC32F460JEUA.svd` (`SEL0` at offset `0x5C`, reset `0x1FF`;
 //!   `VSSEL128` at `0x25C`, reset `0x0`; `EIRQCRn` at `0x10 + 4n`; `EIFR` `0x54`,
 //!   `EIFCR` `0x58`, `SWIER` `0x29C`, `EVTER` `0x2A0`, `IER` `0x2A4`);
-//! * **DDL Rev 3.3.0** (`hc32_ll_interrupts.c`): `INTSEL_RST_VALUE = 0x1FF`,
+//! * **DDL** (`hc32_ll_interrupts.c`): `INTSEL_RST_VALUE = 0x1FF`,
 //!   the `IRQ_GRP_*` window rule, `IRQn_MAX = INT127_IRQn`, and the `VSSEL` bitmask.
 //!
 //! Facts that shape the API:
@@ -136,17 +137,6 @@ pub trait Registers {
     fn nvic_enable(&mut self, line: Line);
 }
 
-/// Claim `line` for `event` if it is free or already ours.
-fn claim(io: &mut impl Registers, event: u16, line: Line) -> Result<(), IrqError> {
-    let current = io.read_sel(line) & SEL_UNMAPPED;
-    if current == SEL_UNMAPPED || current == event as u32 {
-        io.write_sel(line, event as u32);
-        Ok(())
-    } else {
-        Err(IrqError::LineTaken)
-    }
-}
-
 fn release(io: &mut impl Registers, line: Line) {
     io.write_sel(line, SEL_UNMAPPED);
 }
@@ -163,8 +153,13 @@ pub fn register_with(
         return Err(IrqError::PriorityInvalid);
     }
     can_route(event, line)?;
+    // A failed claim must not disable another owner's interrupt.
+    let current = io.read_sel(line) & SEL_UNMAPPED;
+    if current != SEL_UNMAPPED && current != u32::from(event) {
+        return Err(IrqError::LineTaken);
+    }
     io.nvic_disable(line);
-    claim(io, event, line)?;
+    io.write_sel(line, u32::from(event));
     io.nvic_clear_pending(line);
     io.nvic_set_priority(line, priority);
     io.nvic_enable(line);
@@ -360,14 +355,17 @@ pub fn software_interrupt_clear(channel: u8) {
     }
 }
 
-/// Enable or disable an interrupt event request in `IER`.
-pub fn event_request_enable(event: u16, enable: bool) {
+/// Enable or disable the request for NVIC vector `line` in `IER`.
+///
+/// RM 10.5.14: these bits select vectors 0..31, not peripheral event numbers.
+/// The historical function name is retained for compatibility.
+pub fn event_request_enable(line: u16, enable: bool) {
     assert!(
-        u32::from(event) < u32::BITS,
-        "IER only covers the first 32 event requests"
+        u32::from(line) < u32::BITS,
+        "IER only covers NVIC vectors 0..31"
     );
-    let bit = 1u32 << event;
-    // SAFETY: IER is word-aligned and event selects one of its documented request bits.
+    let bit = 1u32 << line;
+    // SAFETY: IER is word-aligned and line selects one of its documented request bits.
     unsafe {
         let reg = IER as *mut u32;
         if enable {
@@ -377,3 +375,6 @@ pub fn event_request_enable(event: u16, enable: bool) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

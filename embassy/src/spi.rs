@@ -1,7 +1,10 @@
 //! Interrupt-driven, transmit-only SPI3 for the existing display setup.
 //!
-//! 8-bit mode 3, MSB first, PCLK1/2, existing frame spacing and reserved CFG1
-//! bit 4 retained. TX-empty (310), idle (311), error (312) are CPU IRQ sources;
+//! One 8-bit frame per DR write, master transmit-only. Mode, bit order, clock
+//! divider and frame spacing are caller-selected; reserved CFG1 bit 4 is kept
+//! set. Errata 4.3.1 imposes gaps of at least 3 SCK + 2 PCLK cycles between
+//! frames even at the fastest spacing. TX-empty (310), idle (311), error (312)
+//! are CPU IRQ sources;
 //! SPTEND (313) is only an event trigger (RM Table 10-2 / §27.10).
 //! No DMA or borrowed buffer pointers are accessed by the ISR.
 
@@ -53,10 +56,32 @@ const RXIE: u32 = 1 << 10;
 const IDIE: u32 = 1 << 11;
 // Mask of all SPI interrupt enables owned by this driver.
 const INTERRUPTS: u32 = EIE | TXIE | RXIE | IDIE;
+// RM 27.12.2: this byte writer requires SPE, MSTR and TXMDS.
+const REQUIRED_CONTROL: u32 = (1 << 6) | (1 << 3) | (1 << 1);
+// DDL SPI_Init rejects mode-fault detection in master mode (CR1.MODFE).
+const MODE_FAULT_DETECTION: u32 = 1 << 12;
+// RM 27.12.2: all low-halfword CR1 bits except reserved bit 2 are defined.
+const CONTROL_MASK: u32 = 0xfffb;
+// RM 27.12.3: CFG1 timing fields, SS polarity, DR read selection and frame count.
+const CFG1_MASK: u32 = (0b111 << 28) | (0b111 << 24) | (0b111 << 20) | (0xf << 8) | (1 << 6) | 0b11;
+// RM 27.12.3 / Errata 2.7.1: CFG1 reserved bit 4 must always be written as one.
+const CFG1_RESERVED_ONE: u32 = 1 << 4;
+// RM 27.12.3: FTHLV=0 selects the single frame written by each byte operation.
+const FRAME_COUNT_MASK: u32 = 0b11;
+// RM 27.12.5: CFG2 is a low-halfword configuration; DSIZE=4 encodes 8 bits.
+const CFG2_MASK: u32 = 0xffff;
+const DATA_SIZE_MASK: u32 = 0xf << 8;
+const DATA_SIZE_8: u32 = 4 << 8;
+// RM 27.12.5: SSA encodings 4..=7 (bit 7 set) are prohibited.
+const PROHIBITED_SS: u32 = 1 << 7;
+// RM 27.12.4: SR.TDEF/RDFF are read-only and must be written as one.
+const STATUS_READ_ONLY_ONES: u32 = EMPTY | (1 << 7);
 static WAKER: AtomicWaker = AtomicWaker::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
+    /// Configuration is not a valid one-frame, 8-bit master TX setup.
+    Config,
     Bus(u32),
     Timeout,
     Faulted,
@@ -91,10 +116,27 @@ pub struct Config {
     pub cfg2: u32,
     pub control: u32,
 }
+fn check_config(config: Config) -> Result<(), Error> {
+    if config.control & REQUIRED_CONTROL != REQUIRED_CONTROL
+        || config.control & (MODE_FAULT_DETECTION | !CONTROL_MASK) != 0
+        || config.cfg1 & !(CFG1_MASK | CFG1_RESERVED_ONE) != 0
+        || config.cfg1 & FRAME_COUNT_MASK != 0
+        || config.cfg2 & (!CFG2_MASK | PROHIBITED_SS) != 0
+        || config.cfg2 & DATA_SIZE_MASK != DATA_SIZE_8
+    {
+        Err(Error::Config)
+    } else {
+        Ok(())
+    }
+}
 fn initialize(bus: &mut impl Registers, config: Config) {
     bus.write(CR1, 0);
-    bus.write(CFG1, config.cfg1);
+    bus.write(CFG1, config.cfg1 | CFG1_RESERVED_ONE);
     bus.write(CFG2, config.cfg2);
+    // RM 27.12.4 / DDL SPI_DeInit: read then write zero to clear old errors;
+    // write one to TDEF/RDFF, and zero to reserved bits.
+    let _ = bus.read(SR);
+    bus.write(SR, STATUS_READ_ONLY_ONES);
     bus.write(CR1, config.control & !INTERRUPTS);
 }
 
@@ -199,12 +241,13 @@ pub struct Spi3 {
     failed: bool,
 }
 impl Spi3 {
-    /// Initialize the proven display settings and register the three IRQ routes.
+    /// Validate the byte-transfer configuration and register the three IRQ routes.
     ///
     /// # Safety
     /// Caller must exclusively own SPI3 and its pins; clocks/PWC write access
     /// must be ready, inherited display DMA stopped, and INTC routes available.
     pub unsafe fn new(peripheral: crate::pac::Spi3, config: Config) -> Result<Self, Error> {
+        check_config(config)?;
         critical_section::with(|_| {
             // PWC FCG1 controls SPI3's clock with an active-low gate at bit 18.
             const CLOCK_GATE: usize = 0x4004_8004;
@@ -268,3 +311,6 @@ impl Drop for Spi3 {
         arm(&mut self.bus, 0);
     }
 }
+
+#[cfg(test)]
+mod tests;

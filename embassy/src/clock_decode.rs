@@ -1,7 +1,7 @@
 //! HC32F460 clock-state decoding from documented CMU registers.
 //!
 //! Decode caller-observed CMU registers without assuming an inherited clock.
-//! Authority: RM Rev1.5 sections 4.11.15, 4.11.20, 4.11.21.
+//! Authority: RM sections 4.11.15, 4.11.20, 4.11.21.
 //!
 //! Two inputs are assumptions, not measurements, and are passed in by the caller:
 //! the board XTAL frequency and the HRC frequency (16 or 20 MHz,
@@ -12,7 +12,7 @@
 pub const HRC_20MHZ: u32 = 20_000_000;
 /// HRC selection: `ICG1.HRCFREQSEL = 1` (RM section 6.2.2).
 pub const HRC_16MHZ: u32 = 16_000_000;
-/// Internal medium-speed RC, typical value per datasheet Rev1.61.
+/// Internal medium-speed RC, typical value per DS.
 pub const MRC_HZ: u32 = 8_000_000;
 /// Internal low-speed RC and the 32.768 kHz crystal share a nominal rate.
 pub const LRC_HZ: u32 = 32_768;
@@ -27,6 +27,8 @@ pub const PLL_PFD_MAX_HZ: u32 = 25_000_000;
 pub const PLL_VCO_MIN_HZ: u32 = 240_000_000;
 /// Maximum documented MPLL VCO frequency in Hz (RM 4.11.15).
 pub const PLL_VCO_MAX_HZ: u32 = 480_000_000;
+// RM 4.11.15: largest permitted true MPLLM input division factor.
+pub(crate) const PLL_INPUT_MAX_FACTOR: u8 = 24;
 
 // Vendor SVD: CKSW and each SCFGR divider selector occupy three bits.
 pub(crate) const SELECTOR_MASK: u32 = 0b111;
@@ -68,16 +70,23 @@ pub enum ClockError {
     ProhibitedDivide,
     /// `MPLLP[3:0]` was 0, which the manual marks as prohibited.
     ProhibitedPllDivider,
+    /// `MPLLM[4:0]` encoded a factor above 24 (RM 4.11.15).
+    ProhibitedPllInputDivider,
+    /// The decoded clock exceeds the representable frequency in Hz.
+    FrequencyOverflow,
 }
 
 impl ClockError {
-    /// Legacy on-target status code: 1 = source, 2 = divider, 3 = PLL divider.
+    /// On-target status code: 1 = source, 2 = divider, 3 = PLL output divider,
+    /// 4 = PLL input divider, 5 = frequency overflow. Existing codes retain their meanings.
     /// Zero is reserved for no error; preserve these values for existing consumers.
     pub fn code(self) -> u8 {
         match self {
             ClockError::ProhibitedSource(_) => 1,
             ClockError::ProhibitedDivide => 2,
             ClockError::ProhibitedPllDivider => 3,
+            ClockError::ProhibitedPllInputDivider => 4,
+            ClockError::FrequencyOverflow => 5,
         }
     }
 }
@@ -149,9 +158,14 @@ pub fn pll_from_pllcfgr(raw: u32) -> Result<Pll, ClockError> {
     if p_field == 0 {
         return Err(ClockError::ProhibitedPllDivider);
     }
+    // RM 4.11.15 permits true MPLLM factors 1..=24, not all five-bit encodings.
+    let m = (raw & PLL_M_MASK) + 1;
+    if m > u32::from(PLL_INPUT_MAX_FACTOR) {
+        return Err(ClockError::ProhibitedPllInputDivider);
+    }
     Ok(Pll {
         source_hrc: raw & PLL_SOURCE_HRC != 0,
-        m: (raw & PLL_M_MASK) + 1,
+        m,
         n: ((raw >> PLL_N_SHIFT) & PLL_N_MASK) + 1,
         p: p_field + 1,
     })
@@ -179,11 +193,17 @@ pub fn state_from_registers(
         Source::Mpll => {
             let pll = pll_from_pllcfgr(pllcfgr_raw)?;
             let input = if pll.source_hrc { hrc_hz } else { xtal_hz };
-            let pfd = input / pll.m;
-            let vco = pfd * pll.n;
-            pll_plausible = (PLL_PFD_MIN_HZ..=PLL_PFD_MAX_HZ).contains(&pfd)
-                && (PLL_VCO_MIN_HZ..=PLL_VCO_MAX_HZ).contains(&vco);
-            vco / pll.p
+            // RM 4.11.15 defines a ratio, not sequential integer division.
+            // Keep the numerator exact for both limits and the returned rate.
+            let input = u64::from(input);
+            let m = u64::from(pll.m);
+            let vco_numerator = input * u64::from(pll.n);
+            pll_plausible = input >= u64::from(PLL_PFD_MIN_HZ) * m
+                && input <= u64::from(PLL_PFD_MAX_HZ) * m
+                && vco_numerator >= u64::from(PLL_VCO_MIN_HZ) * m
+                && vco_numerator <= u64::from(PLL_VCO_MAX_HZ) * m;
+            u32::try_from(vco_numerator / (m * u64::from(pll.p)))
+                .map_err(|_| ClockError::FrequencyOverflow)?
         }
     };
     let hclk_hz = system_hz / divide_from_scfgr((scfgr_raw >> HCLK_SHIFT) & SELECTOR_MASK)?;
@@ -203,8 +223,11 @@ pub fn state_from_registers(
 /// Nominal HRC frequency from the vendor DDL's frequency-monitor selector.
 ///
 /// RM 6.2.2 documents `ICG1.HRCFREQSEL` (`0` = 20 MHz, `1` = 16 MHz).
-/// DDL Rev3.3.0 `system_hc32f460.c::SystemCoreClockUpdate` uses the same
-/// mapping for `HRC_FREQ_MON()`. Vendor reference links are in [`crate::clocks`].
+/// DDL `system_hc32f460.c::SystemCoreClockUpdate` uses the same
+/// mapping for `HRC_FREQ_MON()`.
 pub fn hrc_hz_from_readback_bit(bit: bool) -> u32 {
     if bit { HRC_16MHZ } else { HRC_20MHZ }
 }
+
+#[cfg(test)]
+mod tests;

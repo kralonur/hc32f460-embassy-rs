@@ -6,7 +6,7 @@
 //!
 //! Only interior compare values are supported. This deliberately does not
 //! implement `embedded_hal::pwm::SetDutyCycle`: 0%/100% require separate output
-//! handling (errata Rev 1.41 §3.3.3). Runtime compare updates are unbuffered and
+//! handling (Errata §3.3.3). Runtime compare updates are unbuffered and
 //! are not guaranteed glitch-free. §3.3.2 also prevents guaranteeing the initial
 //! output level with a divided clock; normal output settles at the period match.
 
@@ -20,8 +20,14 @@ const CNTER: usize = 0x00;
 const PERAR: usize = 0x04;
 // Vendor SVD / RM 21.5.3: first channel's comparison register byte offset.
 const CMPAR: usize = 0x40;
-// Vendor SVD / RM 21.5.4: TimerA control/status register byte offset.
-const BCSTR: usize = 0x80;
+// RM-ZH 21.5.4–21.5.5 / DDL: separate byte-wide counter control and status.
+const BCSTRL: usize = 0x80;
+const BCSTRH: usize = 0x81;
+// Errata 3.3.5: clear START and CKDIV together before writing CNTER.
+// DIR=1 keeps the existing up-count direction while stopped and undivided.
+const STOP_UNDIVIDED: u8 = 1 << 1;
+// RM-ZH 21.5.5: no overflow/underflow interrupts or retained status flags.
+const COUNTER_STATUS_RESET: u8 = 0;
 // Vendor SVD: first channel's output-control register byte offset.
 const PCONR: usize = 0x140;
 // Vendor SVD: PWC FCG2.TIMERA_4 (bit 5) disables TimerA4's clock when set.
@@ -34,10 +40,10 @@ const CHANNEL_STRIDE: usize = 4;
 const MIN_PERIOD: u16 = 2;
 // RM 21.5 PCONR: OUTEN=1, CMPC=0b11 (invert), PERC=0b01 (high),
 // STAC=0b01 (high at start), STPC=0b00, FORC=0b00. Preserve the original
-// setup; the start-level request is ineffective with /256 per errata §3.3.2.
+// setup; the start-level request is ineffective with /256 per Errata §3.3.2.
 const OUTPUT: u16 = 0x1071;
-// RM 21.5.4 BCSTR: CKDIV=8 (/256), DIR=1 (up), MODE=0 (sawtooth), START=1.
-const RUN: u16 = 0x0083;
+// RM-ZH 21.5.4: CKDIV=8 (/256), DIR=1 (up), MODE=0 (sawtooth), START=1.
+const RUN: u8 = 0x83;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -50,6 +56,7 @@ trait Registers {
     fn read_gate(&mut self) -> u32;
     fn write_gate(&mut self, value: u32);
     fn write_timer(&mut self, offset: usize, value: u16);
+    fn write_control(&mut self, offset: usize, value: u8);
 }
 
 struct Mmio;
@@ -69,6 +76,18 @@ impl Registers for Mmio {
         // SAFETY: Internal helpers use documented halfword-aligned TimerA4 offsets,
         // and construction requires exclusive ownership of the timer.
         unsafe { (pac::Tmra4::ptr().cast::<u8>().add(offset) as *mut u16).write_volatile(value) }
+    }
+
+    fn write_control(&mut self, offset: usize, value: u8) {
+        // SAFETY: Only the documented byte-wide BCSTRL/BCSTRH offsets reach here;
+        // the caller exclusively owns TimerA4.
+        unsafe {
+            pac::Tmra4::ptr()
+                .cast::<u8>()
+                .add(offset)
+                .cast_mut()
+                .write_volatile(value)
+        }
     }
 }
 
@@ -111,11 +130,13 @@ fn set_compare(
 fn start(bus: &mut impl Registers, channel: u8, period: u16, compare: u16) -> Result<(), Error> {
     check_compare(period, compare)?;
     let index = usize::from(channel - 1);
+    bus.write_control(BCSTRL, STOP_UNDIVIDED);
+    bus.write_control(BCSTRH, COUNTER_STATUS_RESET);
     bus.write_timer(CNTER, 0);
     bus.write_timer(PERAR, period);
     bus.write_timer(PCONR + CHANNEL_STRIDE * index, OUTPUT);
     bus.write_timer(CMPAR + CHANNEL_STRIDE * index, compare);
-    bus.write_timer(BCSTR, RUN);
+    bus.write_control(BCSTRL, RUN);
     Ok(())
 }
 
@@ -148,7 +169,7 @@ impl TimerA4Pwm {
     }
 
     /// Configure and start the counter. Use once after pin routing; calling
-    /// again resets the counter. The compare value must be in `1..period`.
+    /// again stops and resets the counter. The compare value must be in `1..period`.
     pub fn start(&mut self, compare: u16) -> Result<(), Error> {
         start(&mut Mmio, self.channel, self.period, compare)
     }
@@ -159,3 +180,6 @@ impl TimerA4Pwm {
         set_compare(&mut Mmio, self.channel, self.period, compare)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -74,7 +74,7 @@ const MPLL_STABLE: u8 = 1 << 5;
 const UPLL_STABLE: u8 = 1 << 6;
 // RM 4.11.23: selector zero uses the PCLK2/PCLK4 bus clocks.
 const PERIPHERAL_CLOCK_MASK: u16 = 0xf;
-// DDL Rev3.3.0 system_hc32f460.c, HRC_FREQ_MON(): frequency-selection readback.
+// DDL system_hc32f460.c, HRC_FREQ_MON(): frequency-selection readback.
 const HRC_FREQUENCY_READBACK: usize = 0x40010684;
 // DDL SystemCoreClockUpdate(): bit zero set means nominal 16 MHz, clear 20 MHz.
 const HRC_16MHZ_SELECTED: u32 = 1;
@@ -195,6 +195,15 @@ fn setup(io: &mut impl Registers, config: Config) -> Result<Clocks, Error> {
     }
     unlock(io);
     let value = io.read8(PLLCR);
+    // RM 4.11.16 note 2: an enabled MPLL must stabilize before software stops it.
+    // The inherited source need not be MPLL even when the PLL is starting.
+    if value & PLL_STOP == 0 {
+        let ready = wait(io, MPLL_STABLE, MPLL_STABLE, Ready::MpllStable);
+        if let Err(error) = ready {
+            lock(io);
+            return Err(error);
+        }
+    }
     io.write8(PLLCR, value | PLL_STOP);
     let stopped = wait(io, MPLL_STABLE, 0, Ready::MpllStopped);
     lock(io);
