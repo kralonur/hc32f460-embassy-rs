@@ -1,15 +1,40 @@
-# HC32F460 Embassy support
+# hc32f460-embassy-rs
 
-> **Warning: this is not a complete Embassy HAL implementation.** It contains
+Rust support for the HC32F460 microcontroller: a peripheral access crate
+(`hc32f460-pac`, in `pac/`) generated from the vendor SVD, and an Embassy HAL
+(`embassy-hc32`, in `embassy/`) on top of it.
+
+> **Warning:** this is not a complete Embassy HAL implementation. It contains
 > only the functionality I used in my own project. Peripheral support and APIs
 > are incomplete; review the implementation and validate it on your hardware
 > before relying on it.
 
-A standalone Rust workspace for the HC32F460 peripheral access crate (`pac/`)
-and Embassy HAL (`embassy/`). The HAL includes clocks, INTC routing, GPIO,
-async EXTI, SysTick time support, TimerA4 PWM, async I²C3, and transmit-only SPI3.
+## Features
 
-Both crates use the Rust 2024 edition; the workspace uses Cargo resolver 3.
+- **Clocks:** HRC and MPLL startup with checked dividers and bus limits.
+- **Interrupts:** INTC routing of peripheral events to NVIC vectors.
+- **GPIO** and **async EXTI** external interrupts.
+- **Time:** an Embassy time driver on SysTick.
+- **TimerA4 PWM.**
+- **Async I²C3** master.
+- **Transmit-only SPI3** master.
+- **PAC:** every register of the vendor SVD, plus the 144 INTC vectors and
+  the interrupt-event identifiers the SVD lacks.
+
+## Limitations
+
+- Only the peripherals above are implemented; the rest exist only as PAC
+  registers, unaudited.
+- I²C: a read followed by a repeated-start write is refused
+  (`Error::ReadRestart`); write-then-read is supported.
+- SPI: one-frame, 8-bit master transmit only; no receive, no slave mode, and
+  gaps between frames are unavoidable.
+- No stop or power-down mode support; SysTick time stops while its clock does.
+- The board owns power mode, SRAM wait states, memory placement, the shared
+  32 kHz crystal and the linker/startup code (see the obligations under
+  [Hardware reference documents](#hardware-reference-documents)).
+- Host tests simulate the registers; they do not prove timing or behaviour on
+  silicon.
 
 ## Hardware reference documents
 
@@ -157,9 +182,20 @@ Running svd2rust on the unmodified SVD alone will not reproduce the additional
 vectors and event identifiers. The script uses the committed SVD and header,
 formats the generated Rust, and preserves the workspace manifests.
 
+## Build and validation
+
+- Current stable Rust toolchain, Rust 2024 edition, Cargo resolver 3.
+- Target `thumbv7em-none-eabihf` (`rustup target add thumbv7em-none-eabihf`).
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --locked --target thumbv7em-none-eabihf
+cargo clippy --workspace --locked --target thumbv7em-none-eabihf -- -D warnings
+```
+
 ## License
 
-This project's original Rust code and tooling are dual-licensed under either
+This project's original code is dual-licensed under either
 [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option
 (`MIT OR Apache-2.0`). Third-party material is subject to its own terms.
 
