@@ -353,6 +353,62 @@ fn analog(bus: &mut impl Registers, port: Port, pin: u8) {
     );
 }
 
+/// Pins of one port driven together, each high, low or undriven: one write
+/// each to PORR, POSR and POER changes the whole group.
+pub struct OutputGroup<const N: usize> {
+    port: Port,
+    pins: [u8; N],
+}
+impl<const N: usize> OutputGroup<N> {
+    /// Select GPIO with digital functions and high drive on `pins`, outputs
+    /// disabled, so the pins stay undriven until [`Self::drive`].
+    /// # Safety
+    /// Caller must exclusively own these distinct bonded pins and have clocks
+    /// ready; debug functions on them must already be released (RM 9.4.12).
+    pub unsafe fn new_high_drive(port: Port, pins: [u8; N]) -> Self {
+        for pin in pins {
+            validate(port, pin);
+        }
+        protected(&mut Mmio, |bus| {
+            for pin in pins {
+                undriven_high_drive(bus, port, pin);
+            }
+        });
+        Self { port, pins }
+    }
+    /// Drive each pin, in construction order, to its level, or leave it
+    /// undriven (`None`). Levels latch before the outputs enable.
+    pub fn drive(&mut self, levels: [Option<Level>; N]) {
+        critical_section::with(|_| drive_group(&mut Mmio, self.port, &self.pins, &levels));
+    }
+}
+fn undriven_high_drive(bus: &mut impl Registers, port: Port, pin: u8) {
+    function(bus, port, pin, GPIO_FUNCTION);
+    modify(
+        bus,
+        pcr(port, pin),
+        OUTPUT_PROFILE_CLEAR | PCR_POUTE,
+        PCR_DRV_HIGH,
+    );
+}
+fn drive_group(bus: &mut impl Registers, port: Port, pins: &[u8], levels: &[Option<Level>]) {
+    let (mut group, mut high, mut low) = (0, 0, 0);
+    for (&pin, level) in pins.iter().zip(levels) {
+        let bit = 1 << pin;
+        group |= bit;
+        match level {
+            Some(Level::High) => high |= bit,
+            Some(Level::Low) => low |= bit,
+            None => {}
+        }
+    }
+    // PORR and POSR are write-one (vendor SVD), so only the group's pins
+    // change; POER keeps the port's other pins.
+    bus.write(port_register(port, PORR), low);
+    bus.write(port_register(port, POSR), high);
+    modify(bus, port_register(port, POER), group, high | low);
+}
+
 /// The three configuration sequences already used by board peripheral setup.
 #[derive(Clone, Copy)]
 pub enum AlternateMode {

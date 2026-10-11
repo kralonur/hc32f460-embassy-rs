@@ -13,7 +13,7 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
 
 - **Clocks:** HRC and MPLL startup with checked dividers and bus limits.
 - **Interrupts:** INTC routing of peripheral events to NVIC vectors.
-- **GPIO** (digital and analog pins) and **async EXTI** external interrupts.
+- **GPIO** (digital, analog and grouped output pins) and **async EXTI** external interrupts.
 - **Time:** an Embassy time driver on SysTick.
 - **TimerA4 PWM.**
 - **Async ADC2:** one software-started 12-bit scan of up to eight pins and

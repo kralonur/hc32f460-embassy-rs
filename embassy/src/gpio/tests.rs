@@ -1,4 +1,5 @@
-//! Pin-mux latch ordering and cross-port EXTI ownership regressions.
+//! Pin-mux latch ordering, cross-port EXTI ownership and output-group
+//! regressions.
 extern crate std;
 use super::*;
 use std::{collections::BTreeMap, vec::Vec};
@@ -44,4 +45,27 @@ fn exti_claim_clears_competitors_outside_original_jeua_cleanup_subset() {
             PCR_PUU | if port == Port::A { PCR_INTE } else { 0 }
         );
     }
+}
+
+#[test]
+fn output_group_latches_levels_before_enabling_and_keeps_other_pins() {
+    let mut io = Io::default();
+    let enable = port_register(Port::B, POER);
+    // Pins 12 and 14 belong to other owners and stay enabled.
+    io.registers.insert(enable, 1 << 12 | 1 << 14 | 1 << 4);
+    let pins = [8, 3, 9, 4];
+    drive_group(
+        &mut io,
+        Port::B,
+        &pins,
+        &[Some(Level::High), Some(Level::Low), Some(Level::High), None],
+    );
+    assert_eq!(
+        io.writes,
+        [
+            (port_register(Port::B, PORR), 1 << 3),
+            (port_register(Port::B, POSR), 1 << 8 | 1 << 9),
+            (enable, 1 << 12 | 1 << 14 | 1 << 8 | 1 << 3 | 1 << 9),
+        ]
+    );
 }
