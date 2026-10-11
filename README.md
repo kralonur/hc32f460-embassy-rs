@@ -13,9 +13,13 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
 
 - **Clocks:** HRC and MPLL startup with checked dividers and bus limits.
 - **Interrupts:** INTC routing of peripheral events to NVIC vectors.
-- **GPIO** and **async EXTI** external interrupts.
+- **GPIO** (digital and analog pins) and **async EXTI** external interrupts.
 - **Time:** an Embassy time driver on SysTick.
 - **TimerA4 PWM.**
+- **Async ADC2:** one software-started 12-bit scan of up to eight pins and
+  the internal reference, optionally averaged, awaited on its end-of-scan
+  interrupt. The scan owns its pins and the reference token, so it cannot
+  read a pin twice or channel 8 without the reference.
 - **Async I²C3** master.
 - **Transmit-only SPI3** master.
 - **PAC:** every register of the vendor SVD, plus the 144 INTC vectors and
@@ -27,6 +31,8 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
   registers, unaudited.
 - I²C: a read followed by a repeated-start write is refused
   (`Error::ReadRestart`); write-then-read is supported.
+- ADC: ADC2 sequence A only, 12 bits; no ADC1, sequence B, triggers, DMA or
+  analog watchdog.
 - SPI: one-frame, 8-bit master transmit only; no receive, no slave mode, and
   gaps between frames are unavoidable.
 - No stop or power-down mode support; SysTick time stops while its clock does.

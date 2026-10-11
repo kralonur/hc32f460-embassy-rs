@@ -324,6 +324,35 @@ impl embedded_hal::digital::OutputPin for OutputPin {
     }
 }
 
+/// A pin left to its analog function, e.g. an ADC input.
+pub struct AnalogPin {
+    _port: Port,
+    _pin: u8,
+}
+impl AnalogPin {
+    /// Select GPIO and disable every digital function (DDIS), the output
+    /// driver, pull-up and interrupt input (RM 9.4.11, 9.4.12).
+    /// # Safety
+    /// Caller must exclusively own this bonded pin and have clocks ready.
+    pub unsafe fn new(port: Port, pin: u8) -> Self {
+        validate(port, pin);
+        protected(&mut Mmio, |bus| analog(bus, port, pin));
+        Self {
+            _port: port,
+            _pin: pin,
+        }
+    }
+}
+fn analog(bus: &mut impl Registers, port: Port, pin: u8) {
+    function(bus, port, pin, GPIO_FUNCTION);
+    modify(
+        bus,
+        pcr(port, pin),
+        OUTPUT_PROFILE_CLEAR | PCR_POUTE,
+        PCR_DDIS,
+    );
+}
+
 /// The three configuration sequences already used by board peripheral setup.
 #[derive(Clone, Copy)]
 pub enum AlternateMode {
