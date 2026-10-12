@@ -60,8 +60,14 @@ const FLASH_WAIT_MASK: u32 = 0xf;
 const FLASH_LOW_POWER_MASK: u32 = (1 << 0) | (1 << 8);
 // RM Table 7-1: five waits cover the supported 200 MHz HCLK envelope.
 const MIN_FLASH_WAITS: u32 = 5;
-// Only latency/low-power fields may change; preserve cache-control bits.
-const FLASH_READ_MODE_MASK: u32 = (FLASH_WAIT_MASK << FLASH_WAIT_SHIFT) | FLASH_LOW_POWER_MASK;
+// RM 7.9.3: FRMC.CACHE (bit 16) enables the flash read cache. A bootloader can
+// leave it off, which measured about twice as slow for code run from flash.
+const FLASH_CACHE: u32 = 1 << 16;
+// RM 7.9.3: FRMC.CRST (bit 24) resets the cache contents.
+const FLASH_CACHE_RESET: u32 = 1 << 24;
+// Latency, low-power and cache fields are set here; other bits are preserved.
+const FLASH_READ_MODE_MASK: u32 =
+    (FLASH_WAIT_MASK << FLASH_WAIT_SHIFT) | FLASH_LOW_POWER_MASK | FLASH_CACHE;
 // RM 4.11.16, 4.11.18: both PLL stop controls are bit zero.
 const PLL_STOP: u8 = 1;
 // RM 4.11.10, 4.11.14: HRC/LRC stop controls are bit zero.
@@ -172,15 +178,16 @@ fn setup(io: &mut impl Registers, config: Config) -> Result<Clocks, Error> {
     io.write32(EFM_FAPRT, EFM_UNLOCK_SECOND);
     let value = io.read32(FRMC);
     let waits = ((value >> FLASH_WAIT_SHIFT) & FLASH_WAIT_MASK).max(MIN_FLASH_WAITS);
-    io.write32(
-        FRMC,
-        (value & !FLASH_READ_MODE_MASK) | (waits << FLASH_WAIT_SHIFT),
-    );
+    let read_mode = (waits << FLASH_WAIT_SHIFT) | FLASH_CACHE;
+    let value = (value & !(FLASH_READ_MODE_MASK | FLASH_CACHE_RESET)) | read_mode;
+    // Start the cache empty, then run with it on.
+    io.write32(FRMC, value | FLASH_CACHE_RESET);
+    io.write32(FRMC, value);
     if io.read32(EFM_FAPRT) == EFM_UNPROTECTED {
         io.write32(EFM_FAPRT, EFM_UNLOCK_SECOND);
         io.write32(EFM_FAPRT, EFM_UNLOCK_SECOND);
     }
-    if io.read32(FRMC) & FLASH_READ_MODE_MASK != waits << FLASH_WAIT_SHIFT {
+    if io.read32(FRMC) & FLASH_READ_MODE_MASK != read_mode {
         return Err(Error::Readback(Register::FlashReadMode));
     }
     unlock(io);

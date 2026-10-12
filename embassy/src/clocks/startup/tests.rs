@@ -35,7 +35,7 @@ impl Io {
                 (PERICKSEL, 8), // RM 4.11.23: inherited MPLL/P selection.
                 (
                     FRMC,
-                    (7 << FLASH_WAIT_SHIFT) | FLASH_LOW_POWER_MASK | (1 << 16),
+                    (7 << FLASH_WAIT_SHIFT) | FLASH_LOW_POWER_MASK | (1 << 24),
                 ),
                 (PWC, 0x11111111),
                 (PWC + FCG_STRIDE, 0x22222222),
@@ -152,7 +152,8 @@ fn both_hrc_rates_produce_checked_clocks_and_preserve_flash_latency() {
                 system_hz / 2
             ]
         );
-        assert_eq!(io.get(FRMC), (7 << FLASH_WAIT_SHIFT) | (1 << 16));
+        // The inherited cache was off: startup enables it and leaves no reset pending.
+        assert_eq!(io.get(FRMC), (7 << FLASH_WAIT_SHIFT) | FLASH_CACHE);
         assert_eq!(io.get(EFM_FAPRT), 0);
         assert_eq!(io.get(SCFGR), 0x00112210);
         assert_eq!(io.get(PLLCFGR) & decode::PLL_CONFIG_MASK, 0x11101d81);
