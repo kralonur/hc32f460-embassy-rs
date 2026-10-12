@@ -6,13 +6,17 @@
 //! frames even at the fastest spacing. TX-empty (310), idle (311), error (312)
 //! are CPU IRQ sources;
 //! SPTEND (313) is only an event trigger (RM Table 10-2 / §27.10).
-//! No DMA or borrowed buffer pointers are accessed by the ISR.
+//! No borrowed buffer pointers are accessed by the ISR. [`Spi3::write_dma`]
+//! hands a buffer to a [`dma::Channel`] instead, paced by TX-empty events.
 
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::{Duration, with_timeout};
+
+use crate::dma;
+use crate::pac;
 
 // Original driver's NVIC assignments within SPI3's group-9 routing window (86..=91).
 const IRQ_ROUTES: [(u16, u8); 3] = [(310, 86), (311, 87), (312, 88)];
@@ -86,6 +90,7 @@ pub enum Error {
     Timeout,
     Faulted,
     InterruptRouting(crate::intc::IrqError),
+    Dma(dma::Error),
 }
 
 trait Registers {
@@ -233,11 +238,56 @@ async fn write(bus: &mut (impl Registers + Unpin), bytes: &[u8]) -> Result<(), E
     Wait::new(bus, Condition::Idle).await
 }
 
+async fn write_dma(
+    bus: &mut (impl Registers + Unpin),
+    channel: &mut dma::Channel,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    // SAFETY: the PAC's fixed SPI3 block; only DR's address is taken.
+    let dr = unsafe { (*pac::Spi3::ptr()).dr().as_ptr() }.cast::<u8>();
+    for chunk in bytes.chunks(dma::MAX_TRANSFER + 1) {
+        let Some((&first, rest)) = chunk.split_first() else {
+            continue;
+        };
+        // Idle, so the first byte's write is the only one in flight.
+        Wait::new(bus, Condition::Idle).await?;
+        // SAFETY: DR takes byte writes (the CPU path writes it a byte at a
+        // time), SPI3_SPTI marks it ready for the next one (RM Table 10-2),
+        // and the transfer is awaited or dropped below, never leaked.
+        let transfer = unsafe { channel.write(rest, dr, pac::events::EventSource::SPI3_SPTI) }
+            .map_err(Error::Dma)?;
+        bus.write(DR, u32::from(first));
+        transfer.await.map_err(Error::Dma)?;
+    }
+    // The channel finishes once the last byte is in DR; fence it out.
+    Wait::new(bus, Condition::Idle).await
+}
+
+/// Run one transfer under [`WRITE_TIMEOUT`] unless `failed` is latched, and
+/// latch it on any failure.
+async fn bounded(
+    failed: &mut bool,
+    transfer: impl Future<Output = Result<(), Error>>,
+) -> Result<(), Error> {
+    if *failed {
+        return Err(Error::Faulted);
+    }
+    let result = with_timeout(WRITE_TIMEOUT, transfer)
+        .await
+        .unwrap_or(Err(Error::Timeout));
+    if result.is_err() {
+        *failed = true;
+    }
+    result
+}
+
 /// Exclusive SPI3 owner. Configure pins before construction; IRQ vectors must
-/// call [`on_interrupt`] on INT086/087/088. Failures latch this driver off.
+/// call [`on_interrupt`] on INT086/087/088. Failures latch this driver off
+/// until [`Spi3::recover`].
 pub struct Spi3 {
     _peripheral: crate::pac::Spi3,
     bus: Mmio,
+    config: Config,
     failed: bool,
 }
 impl Spi3 {
@@ -280,6 +330,7 @@ impl Spi3 {
         Ok(Self {
             _peripheral: peripheral,
             bus,
+            config,
             failed: false,
         })
     }
@@ -289,16 +340,32 @@ impl Spi3 {
     /// Cancellation masks interrupt sources; already-copied DR data may finish
     /// shifting, so a caller must still fence idle before changing D/C or CS.
     pub async fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.failed {
-            return Err(Error::Faulted);
-        }
-        let result = with_timeout(WRITE_TIMEOUT, write(&mut self.bus, bytes))
-            .await
-            .unwrap_or(Err(Error::Timeout));
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
+        bounded(&mut self.failed, write(&mut self.bus, bytes)).await
+    }
+
+    /// Send bytes through `channel`, which copies one into DR each time the
+    /// transmit buffer empties, and wait for physical idle. The CPU writes
+    /// the first byte of every [`dma::MAX_TRANSFER`] + 1 itself: the buffer
+    /// is already empty when the channel is armed, so only that write makes
+    /// it empty again and raise the first trigger. Same bound, fencing and
+    /// latching as [`Spi3::write`]; cancellation stops the channel.
+    pub async fn write_dma(
+        &mut self,
+        channel: &mut dma::Channel,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        bounded(&mut self.failed, write_dma(&mut self.bus, channel, bytes)).await
+    }
+
+    /// Clear a latched failure: reprogram SPI3 from its configuration, which
+    /// drops any half-sent frame and stale error flags, then fence idle. The
+    /// receiving device may have seen a partial frame; resynchronizing it is
+    /// the caller's job.
+    pub async fn recover(&mut self) -> Result<(), Error> {
+        arm(&mut self.bus, 0);
+        initialize(&mut self.bus, self.config);
+        self.failed = false;
+        self.flush().await
     }
 
     /// Fence the wire before changing a control pin (also after cancellation).

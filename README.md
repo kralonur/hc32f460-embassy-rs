@@ -21,7 +21,7 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
   interrupt. The scan owns its pins and the reference token, so it cannot
   read a pin twice or channel 8 without the reference.
 - **Async I²C3** master.
-- **Transmit-only SPI3** master.
+- **Transmit-only SPI3** master, byte by byte or through DMA.
 - **Async DMA1/DMA2:** event-paced byte copies from memory to a peripheral
   register, awaited on the channel's completion interrupt; dropping a
   transfer stops its channel.
