@@ -22,6 +22,9 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
   read a pin twice or channel 8 without the reference.
 - **Async I²C3** master.
 - **Transmit-only SPI3** master.
+- **Async DMA1/DMA2:** event-paced byte copies from memory to a peripheral
+  register, awaited on the channel's completion interrupt; dropping a
+  transfer stops its channel.
 - **PAC:** every register of the vendor SVD, plus the 144 INTC vectors and
   the interrupt-event identifiers the SVD lacks.
 
@@ -35,6 +38,9 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
   analog watchdog.
 - SPI: one-frame, 8-bit master transmit only; no receive, no slave mode, and
   gaps between frames are unavoidable.
+- DMA: memory-to-peripheral byte copies only, at most 65,535 per transfer, one
+  running channel per unit; no peripheral-to-memory, wider items, repeat,
+  non-sequential, linked-list or reconfiguration modes.
 - No stop or power-down mode support; SysTick time stops while its clock does.
 - The board owns power mode, SRAM wait states, memory placement, the shared
   32 kHz crystal and the linker/startup code (see the obligations under
@@ -137,6 +143,14 @@ Corrections made during the review:
   reserved-one bit, and clear stale errors before enabling. Status/IRQ masks,
   idle fencing and event IDs were checked. Frame gaps are unavoidable
   (`Errata 4.3.1`); this driver does not provide slave-mode operation.
+- **DMA:** channel setup order, field encodings, interrupt masking and flag
+  clearing follow the DDL (`hc32f460_dmac.c`), as does the FCG0 unlock
+  (`hc32f460_pwc.c`). The DDL's wait when enabling one channel while another
+  nears its end is not implemented, hence one running channel per unit.
+  Starting an SPI transmit from an already empty buffer by writing its first
+  byte from the CPU is this driver's choice; vendor-derived drivers toggle
+  SPE instead, which this driver avoids so a selected device never sees the
+  bus stop.
 - **SysTick / Embassy time:** CPU-clock selection, reload bounds, millisecond
   tick accounting and multi-deadline wake queue were reviewed. No new
   chip-document discrepancy was identified in this review.

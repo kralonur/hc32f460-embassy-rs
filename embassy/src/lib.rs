@@ -7,6 +7,7 @@ pub use hc32f460_pac as pac;
 pub mod adc;
 pub mod clock_decode;
 pub mod clocks;
+pub mod dma;
 pub mod exti;
 pub mod gpio;
 pub mod i2c;
