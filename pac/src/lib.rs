@@ -1522,3 +1522,5 @@ pub mod events;
 
 #[cfg(feature = "rt")]
 pub use self::Interrupt as interrupt;
+#[cfg(feature = "rt")]
+pub use cortex_m_rt::interrupt;

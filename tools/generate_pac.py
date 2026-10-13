@@ -94,6 +94,8 @@ def main() -> None:
             "#![allow(warnings)]\n" + lib.read_text()
             + '\npub mod events;\n\n#[cfg(feature = "rt")]\n'
             + "pub use self::Interrupt as interrupt;\n"
+            + '#[cfg(feature = "rt")]\n'
+            + "pub use cortex_m_rt::interrupt;\n"
         )
         (src / "events.rs").write_text(generate_events())
         subprocess.run(

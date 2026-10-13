@@ -13,6 +13,13 @@ keywords = ["arm", "cortex-m", "hc32", "hal", "embassy"]
 targets = ["thumbv7em-none-eabihf"]
 
 [features]
+default = ["time-driver"]
+# Link the HAL's millisecond SysTick driver; disable to use a board time driver.
+time-driver = ["dep:embassy-time-driver", "dep:embassy-time-queue-utils", "embassy-time/tick-hz-1_000"]
+# Export the PAC vectors for cortex-m-rt applications.
+rt = ["hc32f460-pac/rt"]
+# Optional critical-section implementation for single-core Cortex-M boards.
+critical-section-single-core = ["cortex-m/critical-section-single-core"]
 # Bring-up diagnostic only; default builds use interrupt-driven receive waits.
 i2c-rx-poll-diagnostic = []
 
@@ -21,13 +28,14 @@ cortex-m.workspace = true
 critical-section.workspace = true
 embassy-futures.workspace = true
 embassy-sync.workspace = true
-embassy-time = { workspace = true, features = ["tick-hz-1_000"] }
-embassy-time-driver.workspace = true
-embassy-time-queue-utils = { workspace = true, features = ["generic-queue-16"] }
+embassy-time.workspace = true
+embassy-time-driver = { workspace = true, optional = true }
+embassy-time-queue-utils = { workspace = true, optional = true, features = ["generic-queue-16"] }
 embedded-hal.workspace = true
 embedded-hal-async.workspace = true
-hc32f460-pac = { path = "../pac", default-features = false }
+hc32f460-pac = { path = "../pac", default-features = false, features = ["critical-section"] }
 thiserror = { workspace = true, default-features = false }
 
-[dev-dependencies]
+# Host register-model tests need std; embedded examples must stay no_std.
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
 critical-section = { workspace = true, features = ["std"] }
