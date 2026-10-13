@@ -1,0 +1,41 @@
+name: rust
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --locked --all-targets --features embassy-hc32/rt -- -D warnings
+      - run: cargo test -p embassy-hc32 --locked --lib
+      - run: cargo test -p embassy-hc32 --locked --lib --features i2c-rx-poll-diagnostic i2c::tests
+      - run: cargo test -p embassy-hc32 --locked --doc
+      - run: cargo doc -p embassy-hc32 --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  embedded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --locked --target thumbv7em-none-eabihf
+      - run: cargo check -p embassy-hc32 --locked --no-default-features --target thumbv7em-none-eabihf
+      - run: cargo check -p embassy-hc32 --locked --example uart --features rt --target thumbv7em-none-eabihf
+      - run: cargo clippy --workspace --locked --all-features --target thumbv7em-none-eabihf -- -D warnings
+      - run: cargo build --workspace --locked --release --all-features --target thumbv7em-none-eabihf
