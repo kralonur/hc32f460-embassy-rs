@@ -286,6 +286,35 @@ pub unsafe fn register(event: u16, line: Line, priority: u8) -> Result<(), IrqEr
     critical_section::with(|_| register_with(&mut Hardware, event, line, priority))
 }
 
+/// An owned interrupt route. Dropping it disables the line and releases SEL.
+/// Keep it alive for as long as its peripheral can generate interrupts.
+#[must_use = "dropping an interrupt route immediately disables it"]
+pub struct Route {
+    line: Line,
+}
+
+impl Route {
+    /// Route an event to an exclusively owned vector with an installed handler.
+    /// # Safety
+    /// Meet [`register`]'s contract, and do not manually unregister or reassign
+    /// this line while the returned owner is alive.
+    pub unsafe fn new(event: u16, line: Line, priority: u8) -> Result<Self, IrqError> {
+        // SAFETY: the caller transfers the event/vector ownership to this route.
+        unsafe { register(event, line, priority)? };
+        Ok(Self { line })
+    }
+
+    pub fn line(&self) -> Line {
+        self.line
+    }
+}
+
+impl Drop for Route {
+    fn drop(&mut self) {
+        unregister(self.line);
+    }
+}
+
 /// Reset every `SEL0..127` entry to "unmapped"; see [`clear_routes_with`].
 ///
 /// # Safety
@@ -337,22 +366,28 @@ pub fn eirq_clear(pin: u8) {
 pub fn software_interrupt_trigger(channel: u8) {
     assert!(u32::from(channel) < u32::BITS);
     let bit = 1u32 << channel;
-    // SAFETY: SWIER is word-aligned and supports the checked software-interrupt channel.
-    unsafe {
-        let reg = SWIER as *mut u32;
-        reg.write_volatile(reg.read_volatile() | bit);
-    }
+    critical_section::with(|_| {
+        // SAFETY: SWIER is word-aligned and supports the checked channel;
+        // the critical section prevents another channel's RMW being lost.
+        unsafe {
+            let reg = SWIER as *mut u32;
+            reg.write_volatile(reg.read_volatile() | bit);
+        }
+    });
 }
 
 /// Clear a software interrupt channel after handling it.
 pub fn software_interrupt_clear(channel: u8) {
     assert!(u32::from(channel) < u32::BITS);
     let bit = 1u32 << channel;
-    // SAFETY: SWIER is word-aligned and supports the checked software-interrupt channel.
-    unsafe {
-        let reg = SWIER as *mut u32;
-        reg.write_volatile(reg.read_volatile() & !bit);
-    }
+    critical_section::with(|_| {
+        // SAFETY: SWIER is word-aligned and supports the checked channel;
+        // the critical section serializes the shared register's RMW.
+        unsafe {
+            let reg = SWIER as *mut u32;
+            reg.write_volatile(reg.read_volatile() & !bit);
+        }
+    });
 }
 
 /// Enable or disable the request for NVIC vector `line` in `IER`.
@@ -365,15 +400,18 @@ pub fn event_request_enable(line: u16, enable: bool) {
         "IER only covers NVIC vectors 0..31"
     );
     let bit = 1u32 << line;
-    // SAFETY: IER is word-aligned and line selects one of its documented request bits.
-    unsafe {
-        let reg = IER as *mut u32;
-        if enable {
-            reg.write_volatile(reg.read_volatile() | bit);
-        } else {
-            reg.write_volatile(reg.read_volatile() & !bit);
+    critical_section::with(|_| {
+        // SAFETY: IER is word-aligned and line selects a documented request bit;
+        // the critical section preserves other vectors' concurrent updates.
+        unsafe {
+            let reg = IER as *mut u32;
+            if enable {
+                reg.write_volatile(reg.read_volatile() | bit);
+            } else {
+                reg.write_volatile(reg.read_volatile() & !bit);
+            }
         }
-    }
+    });
 }
 
 #[cfg(test)]

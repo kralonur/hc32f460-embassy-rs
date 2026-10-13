@@ -12,6 +12,19 @@ fn config() -> Config {
 }
 
 #[test]
+fn typed_master_config_never_exceeds_requested_clock() {
+    use embedded_hal::spi::{MODE_0, MODE_1, MODE_2, MODE_3};
+    for mode in [MODE_0, MODE_1, MODE_2, MODE_3] {
+        let config = Config::master_tx(100_000_001, 10_000_000, mode).unwrap();
+        assert!(check_config(config).is_ok());
+        let divider = 2u64 << ((config.cfg2 >> 2) & 7);
+        assert!(100_000_001 <= 10_000_000 * divider);
+    }
+    assert!(Config::master_tx(100_000_000, 1, MODE_0).is_err());
+    assert!(Config::master_tx(0, 10_000_000, MODE_0).is_err());
+}
+
+#[test]
 fn incompatible_configs_are_rejected() {
     assert!(check_config(config()).is_ok());
     for invalid in [

@@ -14,9 +14,10 @@
 //! window (see [`crate::intc`]), and calls [`on_interrupt`] from those
 //! lines' handlers, before the first transfer.
 //!
-//! Channels of one unit must not run at the same time: enabling a channel
-//! while another nears its end needs the wait the DDL's `DMA_ChannelCmd`
-//! performs, which this driver does not.
+//! Only one transfer per unit may run: another channel returns [`Error::Busy`].
+//! This avoids enabling a channel while another nears its end, which needs the
+//! wait the DDL's `DMA_ChannelCmd` performs. Cancellation waits for quiescence;
+//! a wedged bus can therefore stall cancellation rather than release live memory.
 //!
 //! Registers are reached through the PAC (vendor SVD `HC32F460JEUA.svd`);
 //! values and sequences follow the vendor DDL (`hc32f460_dmac.c/.h`,
@@ -113,6 +114,8 @@ impl Unit {
 pub enum Error {
     #[error("more than MAX_TRANSFER bytes")]
     TooLong,
+    #[error("another channel of this DMA unit is running")]
+    Busy,
     #[error("the channel hit a bus error (INTSTAT0.TRNERR)")]
     Transfer,
     #[error("a trigger came before the previous one was served (INTSTAT0.REQERR)")]
@@ -125,6 +128,8 @@ pub enum Error {
 /// handler took, until the channel's transfer reads them.
 static ERRORS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static COMPLETE: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+// A nonzero channel bit reserves the unit until its borrowed memory is quiescent.
+static RUNNING: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static WAKERS: [[AtomicWaker; CHANNELS]; 2] = [
     [const { AtomicWaker::new() }; CHANNELS],
     [const { AtomicWaker::new() }; CHANNELS],
@@ -161,12 +166,14 @@ pub unsafe fn split(unit: Unit) -> Result<[Channel; CHANNELS], Error> {
         pwc.fcg0pc()
             .write(|w| unsafe { w.fcg0pcwe().bits(FCG0_KEY) }.prt0().clear_bit());
     });
-    // DDL `DMA_Cmd`.
-    unit.registers().en().write(|w| w.en().set_bit());
     let channels = core::array::from_fn(|index| Channel { unit, index });
     for channel in &channels {
         channel.stop()?;
     }
+    // DDL `DMA_Cmd`. Stop inherited channels before enabling the unit, so a
+    // stale enabled channel cannot restart against an earlier image's memory.
+    unit.registers().en().write(|w| w.en().set_bit());
+    RUNNING[unit as usize].store(0, Ordering::Release);
     Ok(channels)
 }
 
@@ -187,9 +194,10 @@ impl Channel {
     /// caller writing the byte before `source` itself.
     /// # Safety
     /// `destination` must be a peripheral register that takes byte writes,
-    /// and `trigger` an event that paces it. The returned [`Transfer`] must
-    /// be awaited or dropped, not leaked: a leaked transfer keeps reading
-    /// `source` after its borrow ends.
+    /// and `trigger` an event that paces it. `source` must remain alive and
+    /// immutable until the channel is quiescent, even if the transfer is
+    /// forgotten. Await or drop the transfer to enforce this for a borrowed
+    /// buffer; a program-lifetime immutable source also satisfies it.
     pub unsafe fn write<'a>(
         &'a mut self,
         source: &'a [u8],
@@ -198,13 +206,16 @@ impl Channel {
     ) -> Result<Transfer<'a>, Error> {
         let count = u16::try_from(source.len()).map_err(|_| Error::TooLong)?;
         self.stop()?;
-        self.clear_flags();
         if count == 0 {
             return Ok(Transfer {
                 channel: self,
                 running: false,
             });
         }
+        RUNNING[self.unit as usize]
+            .compare_exchange(0, 1 << self.index, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::Busy)?;
+        self.clear_flags();
         let dma = self.unit.registers();
         // SAFETY (register views below): each points into this channel's
         // own copy of the register, CHANNEL_STRIDE bytes per channel, which
@@ -254,6 +265,9 @@ impl Channel {
             });
         });
         self.select_trigger(trigger.0);
+        // Publish source-buffer stores before DMA observes the channel enable.
+        // Cortex-M4 has no data cache; the fence also orders compiler accesses.
+        core::sync::atomic::fence(Ordering::SeqCst);
         // DDL `DMA_ChannelCmd`: CHEN is shared by the unit's channels.
         critical_section::with(|_| {
             dma.chen()
@@ -273,6 +287,8 @@ impl Channel {
             dma.chen()
                 .modify(|r, w| unsafe { w.chen().bits(r.chen().bits() & !bit) });
         });
+        // Ensure the disable reaches the controller before checking inactivity.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let stopped = (0..STOP_POLLS).any(|_| dma.chstat().read().chact().bits() & bit == 0);
         self.select_trigger(NO_TRIGGER);
         if stopped {
@@ -280,6 +296,22 @@ impl Channel {
         } else {
             Err(Error::NotStopped)
         }
+    }
+
+    /// A borrowed buffer cannot be released until the bus master is quiescent.
+    /// A timeout is diagnostic, not permission to keep reading expired memory.
+    fn stop_borrowed(&self) -> Result<(), Error> {
+        let result = self.stop();
+        if result.is_err() {
+            let dma = self.unit.registers();
+            let bit = 1 << self.index;
+            while dma.chstat().read().chact().bits() & bit != 0 {
+                core::hint::spin_loop();
+            }
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        RUNNING[self.unit as usize].store(0, Ordering::Release);
+        result
     }
 
     /// Point this channel's AOS trigger at `event` (DDL `DMA_SetTriggerSrc`).
@@ -305,14 +337,16 @@ impl Channel {
     /// Clear this channel's flags, in hardware and as recorded, so a stale
     /// one cannot end the next transfer.
     fn clear_flags(&self) {
-        let dma = self.unit.registers();
-        let bit = 1 << self.index;
-        // SAFETY: INTCLR0/1 only clear the flags written as one.
-        dma.intclr0()
-            .write(|w| unsafe { w.clrtrnerr().bits(bit).clrreqerr().bits(bit) });
-        dma.intclr1()
-            .write(|w| unsafe { w.clrtc().bits(bit).clrbtc().bits(bit) });
-        self.take_flags();
+        critical_section::with(|_| {
+            let dma = self.unit.registers();
+            let bit = 1 << self.index;
+            // SAFETY: INTCLR0/1 only clear the flags written as one.
+            dma.intclr0()
+                .write(|w| unsafe { w.clrtrnerr().bits(bit).clrreqerr().bits(bit) });
+            dma.intclr1()
+                .write(|w| unsafe { w.clrtc().bits(bit).clrbtc().bits(bit) });
+            self.take_flags();
+        });
     }
 
     /// Take and clear the flags the handler recorded for this channel.
@@ -327,7 +361,10 @@ impl Channel {
 }
 
 /// A running [`Channel::write`]; resolves once the last byte is written.
-/// Dropping it first stops the channel.
+/// Dropping it first stops the channel and waits until it no longer accesses
+/// the source buffer. A permanently wedged DMA bus stalls instead of returning
+/// borrowed memory to its owner while it is still being read.
+#[must_use = "a DMA transfer must be awaited or dropped, never leaked"]
 pub struct Transfer<'a> {
     channel: &'a mut Channel,
     running: bool,
@@ -356,16 +393,16 @@ impl Future for Transfer<'_> {
         };
         // The channel disables itself once its count runs out; after an
         // error it may not, so stop it either way.
+        let stopped = this.channel.stop_borrowed();
         this.running = false;
-        Poll::Ready(result.and(this.channel.stop()))
+        Poll::Ready(result.and(stopped))
     }
 }
 
 impl Drop for Transfer<'_> {
     fn drop(&mut self) {
         if self.running {
-            // A channel that will not stop is reported by the next write.
-            let _ = self.channel.stop();
+            let _ = self.channel.stop_borrowed();
         }
     }
 }

@@ -82,15 +82,33 @@ const PROHIBITED_SS: u32 = 1 << 7;
 const STATUS_READ_ONLY_ONES: u32 = EMPTY | (1 << 7);
 static WAKER: AtomicWaker = AtomicWaker::new();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// Configuration is not a valid one-frame, 8-bit master TX setup.
+    #[error("invalid SPI configuration or unrepresentable clock")]
     Config,
+    #[error("SPI status error: {0:#x}")]
     Bus(u32),
+    #[error("SPI transfer timed out")]
     Timeout,
+    #[error("SPI requires recovery after a failed transfer")]
     Faulted,
+    #[error("SPI interrupt routing failed: {0:?}")]
     InterruptRouting(crate::intc::IrqError),
+    #[error("SPI DMA transfer failed: {0}")]
     Dma(dma::Error),
+}
+
+impl embedded_hal::spi::Error for Error {
+    fn kind(&self) -> embedded_hal::spi::ErrorKind {
+        match self {
+            Self::Bus(status) if status & MODE_FAULT != 0 => {
+                embedded_hal::spi::ErrorKind::ModeFault
+            }
+            Self::Bus(status) if status & OVERRUN != 0 => embedded_hal::spi::ErrorKind::Overrun,
+            _ => embedded_hal::spi::ErrorKind::Other,
+        }
+    }
 }
 
 trait Registers {
@@ -121,6 +139,34 @@ pub struct Config {
     pub cfg2: u32,
     pub control: u32,
 }
+impl Config {
+    /// One-frame, MSB-first, 8-bit master TX with the fastest representable
+    /// clock not exceeding `frequency` in Hz. `pclk1` is the actual SPI clock.
+    /// Pins and chip select remain board/device responsibilities.
+    pub fn master_tx(
+        pclk1: u32,
+        frequency: u32,
+        mode: embedded_hal::spi::Mode,
+    ) -> Result<Self, Error> {
+        use embedded_hal::spi::{Phase, Polarity};
+        if pclk1 == 0 || frequency == 0 {
+            return Err(Error::Config);
+        }
+        // RM 27.12.5: MBR=0..7 selects PCLK1 / 2 through / 256.
+        let encoding = (0..=7)
+            .find(|&encoding| u64::from(pclk1) <= u64::from(frequency) * (2 << encoding))
+            .ok_or(Error::Config)?;
+        Ok(Self {
+            cfg1: CFG1_RESERVED_ONE,
+            cfg2: DATA_SIZE_8
+                | (encoding << 2)
+                | u32::from(mode.phase == Phase::CaptureOnSecondTransition)
+                | (u32::from(mode.polarity == Polarity::IdleHigh) << 1),
+            control: REQUIRED_CONTROL,
+        })
+    }
+}
+
 fn check_config(config: Config) -> Result<(), Error> {
     if config.control & REQUIRED_CONTROL != REQUIRED_CONTROL
         || config.control & (MODE_FAULT_DETECTION | !CONTROL_MASK) != 0
@@ -289,6 +335,7 @@ pub struct Spi3 {
     bus: Mmio,
     config: Config,
     failed: bool,
+    _routes: [crate::intc::Route; 3],
 }
 impl Spi3 {
     /// Validate the byte-transfer configuration and register the three IRQ routes.
@@ -310,28 +357,27 @@ impl Spi3 {
         });
         let mut bus = Mmio;
         initialize(&mut bus, config);
-        for (index, &(event, line)) in IRQ_ROUTES.iter().enumerate() {
+        let claim = |(event, line)| {
             // Invariant: IRQ_ROUTES contains only valid HC32F460 NVIC line numbers.
             let line = crate::intc::Line::new(line)
                 .expect("fixed SPI3 interrupt route must use a valid NVIC line");
-            // SAFETY: The caller owns SPI3 and the installed handlers; these are
-            // its documented event sources and the original driver's routes.
-            let result = unsafe { crate::intc::register(event, line, IRQ_PRIORITY) };
-            if let Err(error) = result {
-                for &(_, claimed) in &IRQ_ROUTES[..index] {
-                    // Invariant: Every rollback line comes from the same fixed IRQ_ROUTES.
-                    let line = crate::intc::Line::new(claimed)
-                        .expect("fixed SPI3 rollback route must use a valid NVIC line");
-                    crate::intc::unregister(line);
-                }
-                return Err(Error::InterruptRouting(error));
-            }
-        }
+            // SAFETY: The caller owns SPI3 and its installed interrupt handlers.
+            unsafe { crate::intc::Route::new(event, line, IRQ_PRIORITY) }
+                .map_err(Error::InterruptRouting)
+        };
+        // Partial array initialization drops earlier routes on failure. Successful
+        // construction retains them until the peripheral's interrupt sources stop.
+        let routes = [
+            claim(IRQ_ROUTES[0])?,
+            claim(IRQ_ROUTES[1])?,
+            claim(IRQ_ROUTES[2])?,
+        ];
         Ok(Self {
             _peripheral: peripheral,
             bus,
             config,
             failed: false,
+            _routes: routes,
         })
     }
 
@@ -349,10 +395,26 @@ impl Spi3 {
     /// is already empty when the channel is armed, so only that write makes
     /// it empty again and raise the first trigger. Same bound, fencing and
     /// latching as [`Spi3::write`]; cancellation stops the channel.
-    pub async fn write_dma(
+    ///
+    /// # Safety
+    /// The future must be awaited or dropped, not forgotten after it is polled:
+    /// a leaked future can leave DMA reading `bytes` after its borrow ends.
+    /// Prefer [`Self::write_dma_static`] when the buffer is permanent.
+    pub async unsafe fn write_dma(
         &mut self,
         channel: &mut dma::Channel,
         bytes: &[u8],
+    ) -> Result<(), Error> {
+        bounded(&mut self.failed, write_dma(&mut self.bus, channel, bytes)).await
+    }
+
+    /// Safe DMA transmission from immutable program-lifetime storage. Even if
+    /// this future is forgotten, the DMA source cannot expire or be mutated.
+    /// Dropping a polled future still waits for channel quiescence.
+    pub async fn write_dma_static(
+        &mut self,
+        channel: &mut dma::Channel,
+        bytes: &'static [u8],
     ) -> Result<(), Error> {
         bounded(&mut self.failed, write_dma(&mut self.bus, channel, bytes)).await
     }
@@ -373,6 +435,10 @@ impl Spi3 {
         self.write(&[]).await
     }
 }
+impl embedded_hal::spi::ErrorType for Spi3 {
+    type Error = Error;
+}
+
 impl Drop for Spi3 {
     fn drop(&mut self) {
         arm(&mut self.bus, 0);
