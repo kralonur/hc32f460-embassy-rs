@@ -169,8 +169,18 @@ const MIN_WIDTH_SUM: u32 = 2;
 // Two five-bit widths can represent at most 31 + 31 reference-clock ticks.
 const MAX_WIDTH_SUM: u32 = 2 * CCR_WIDTH_MASK;
 // RM-ZH 26.5.13 with one-cycle filtering: each SCL phase adds 3+1 ticks
-// at CKDIV=0, or 2+1 ticks at CKDIV=1. Tuple fields are (divider, phase overhead).
-const CLOCK_DIVIDERS: [(u32, u32); 2] = [(1, 4), (2, 3)];
+// at CKDIV=0, or 2+1 ticks for every nonzero CKDIV. RM 26.5.13
+// encodes /1 through /128; tuples are (divider, phase overhead).
+const CLOCK_DIVIDERS: [(u32, u32); 8] = [
+    (1, 4),
+    (2, 3),
+    (4, 3),
+    (8, 3),
+    (16, 3),
+    (32, 3),
+    (64, 3),
+    (128, 3),
+];
 // DS Table 3-24: standard/fast-mode maximum bus frequencies, in Hz.
 const STANDARD_MAX_HZ: u32 = 100_000;
 const FAST_MAX_HZ: u32 = 400_000;
@@ -217,29 +227,57 @@ pub fn last_step() -> u32 {
     LAST_STEP.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// NACK, arbitration loss, or peripheral timeout.
+    #[error("I2C bus error")]
     Bus,
+    #[error("I2C target did not acknowledge")]
+    Nack,
+    #[error("I2C arbitration lost")]
+    Arbitration,
+    #[error("I2C peripheral timeout")]
+    PeripheralTimeout,
     /// Operation did not complete inside its bound. The payload is the last
     /// wait entered (the `STEP_*` constants), which may differ from where time was spent.
+    #[error("I2C operation timed out after step {0}")]
     Timeout(u32),
     /// The bus clock cannot be represented for the current PCLK3.
+    #[error("unrepresentable I2C clock")]
     Clock,
     /// Reserved for callers reporting an unavailable bus master.
+    #[error("I2C master unavailable")]
     NotReady,
     /// Address is outside the supported seven-bit range; no I/O performed.
+    #[error("I2C address exceeds seven bits")]
     Address,
     /// A read followed by a write needs a repeated start, but Errata 4.1.1
     /// requires STOP at the end of master reception. No I/O is performed.
+    #[error("read-to-write repeated start is not supported by the receive workaround")]
     ReadRestart,
 }
 
 impl embedded_hal::i2c::Error for Error {
     fn kind(&self) -> embedded_hal::i2c::ErrorKind {
-        // Bus currently groups NACK/arbitration/hardware timeout; do not invent
-        // a more specific cause than the driver recorded.
-        embedded_hal::i2c::ErrorKind::Other
+        match self {
+            Self::Nack => embedded_hal::i2c::ErrorKind::NoAcknowledge(
+                embedded_hal::i2c::NoAcknowledgeSource::Unknown,
+            ),
+            Self::Arbitration => embedded_hal::i2c::ErrorKind::ArbitrationLoss,
+            _ => embedded_hal::i2c::ErrorKind::Other,
+        }
+    }
+}
+
+fn status_error(status: u32) -> Error {
+    if status & ARLOF != 0 {
+        Error::Arbitration
+    } else if status & NACKF != 0 {
+        Error::Nack
+    } else if status & TMOUTF != 0 {
+        Error::PeripheralTimeout
+    } else {
+        Error::Bus
     }
 }
 
@@ -330,7 +368,7 @@ async fn wait(
     .await;
     bus.write(CR2, 0); // never leave a level source armed
     if sr & ERROR != 0 {
-        Err(Error::Bus)
+        Err(status_error(sr))
     } else {
         Ok(())
     }
@@ -348,7 +386,7 @@ fn poll_receive(bus: &mut impl Registers, step: u32) -> Result<(), Error> {
     for _ in 0..RX_POLL_LIMIT {
         let sr = bus.read(SR);
         if sr & ERROR != 0 {
-            return Err(Error::Bus);
+            return Err(status_error(sr));
         }
         if sr & RFULLF != 0 {
             return Ok(());
@@ -392,7 +430,7 @@ async fn send(bus: &mut impl Registers, byte: u8) -> Result<(), Error> {
     wait(bus, TENDF, TENDF, WAKE_TEND, STEP_TX_DONE).await?;
     // ACKRF set means a NACK came back for this byte.
     if bus.read(SR) & ACKRF != 0 {
-        Err(Error::Bus)
+        Err(Error::Nack)
     } else {
         Ok(())
     }
@@ -495,7 +533,7 @@ async fn transfer(
             // TENDF invalid in receive mode, Errata 4.1.2: retain RXI wake.
             wait(bus, TRA, 0, WAKE_RX_FULL, STEP_RX_MODE).await?;
             if bus.read(SR) & ACKRF != 0 {
-                return Err(Error::Bus);
+                return Err(Error::Nack);
             }
             let mut first = true;
             for op in &mut ops[index..end] {
@@ -562,15 +600,15 @@ async fn bounded_transfer(
 }
 
 /// Baud-rate register value for the caller's requested bus speed.
-/// Uses CCR.CKDIV=0 (PCLK3/1) when representable, otherwise CKDIV=1 (PCLK3/2)
-/// with a rounded-up period. Returns None when neither setting can represent it.
+/// Choose the smallest CCR.CKDIV (PCLK3/1 through /128) that represents
+/// a rounded-up period. Returns None when no divider can represent it.
 ///
 /// RM 26.5.13: the timing model uses an enabled one-cycle digital filter,
 /// configured by the constructor. DS Table 3-24 supplies minimum low/high times;
 /// the requested frequency is an upper bound, not an exact-rate guarantee.
 /// Physical rise/fall times and pull-ups still require board validation.
 pub fn timing(pclk: u32, frequency: u32) -> Option<u32> {
-    if frequency == 0 || frequency > FAST_MAX_HZ {
+    if pclk == 0 || frequency == 0 || frequency > FAST_MAX_HZ {
         return None;
     }
     let (low_ns, high_ns) = if frequency <= STANDARD_MAX_HZ {
@@ -588,9 +626,11 @@ pub fn timing(pclk: u32, frequency: u32) -> Option<u32> {
         };
         let min_low = minimum_width(low_ns);
         let min_high = minimum_width(high_ns);
-        let Some(count) = pclk.div_ceil(frequency * divisor).checked_sub(2 * overhead) else {
-            continue;
-        };
+        // A slow peripheral clock may already impose a period longer than
+        // requested. The frequency is an upper bound, so use minimum widths.
+        let count = pclk
+            .div_ceil(frequency * divisor)
+            .saturating_sub(2 * overhead);
         let low = (count / 2).max(min_low);
         let high = count.saturating_sub(low).max(min_high);
         if !(MIN_WIDTH_SUM..=MAX_WIDTH_SUM).contains(&(low + high))
@@ -647,11 +687,13 @@ impl Registers for Hardware {
     }
 }
 
-/// The async I2C3 master. Its field is private, so only [`I2c3::new`] can
-/// create one.
+/// The async I2C3 master. Private fields enforce construction through
+/// [`I2c3::new`] or [`I2c3::from_peripheral`].
 pub struct I2c3 {
     bus: Hardware,
+    _peripheral: crate::pac::I2c3,
     _pins: [crate::gpio::AlternatePin; 2],
+    ccr: u32,
 }
 
 impl I2c3 {
@@ -667,21 +709,51 @@ impl I2c3 {
         frequency: u32,
         pins: [crate::gpio::AlternatePin; 2],
     ) -> Result<Self, Error> {
+        // SAFETY: the legacy constructor requires exclusive peripheral ownership.
+        let peripheral = unsafe { crate::pac::I2c3::steal() };
+        // SAFETY: board, pin and interrupt obligations are forwarded unchanged.
+        unsafe { Self::from_peripheral(peripheral, pclk3, frequency, pins) }
+    }
+
+    /// Ownership-checked construction using a PAC I2C3 token.
+    /// # Safety
+    /// Meet [`Self::new`]'s clock, pin and installed-handler requirements.
+    pub unsafe fn from_peripheral(
+        peripheral: crate::pac::I2c3,
+        pclk3: u32,
+        frequency: u32,
+        pins: [crate::gpio::AlternatePin; 2],
+    ) -> Result<Self, Error> {
         let ccr = timing(pclk3, frequency).ok_or(Error::Clock)?;
 
         // PWC FCG1 controls I2C3's clock with an active-low gate at bit 6.
         const CLOCK_GATE: usize = 0x4004_8004;
         // Vendor SVD: FCG1.I2C3 (bit 6) disables the I2C3 clock when set.
         const CLOCK_BIT: u32 = 1 << 6;
-        // SAFETY: FCG1 is word-aligned; the caller guarantees exclusive startup
-        // configuration and PWC write access before using I2C3.
-        let gate = CLOCK_GATE as *mut u32;
-        unsafe { gate.write_volatile(gate.read_volatile() & !CLOCK_BIT) };
+        critical_section::with(|_| {
+            // SAFETY: FCG1 is word-aligned; PWC writes are permitted by the
+            // caller, and the critical section serializes other gate owners.
+            let gate = CLOCK_GATE as *mut u32;
+            unsafe { gate.write_volatile(gate.read_volatile() & !CLOCK_BIT) };
+        });
 
         let mut bus = Hardware;
         initialize(&mut bus, ccr);
 
-        Ok(Self { bus, _pins: pins })
+        Ok(Self {
+            bus,
+            _peripheral: peripheral,
+            _pins: pins,
+            ccr,
+        })
+    }
+
+    /// Reset the peripheral's communication state and restore its configuration
+    /// after failure/cancellation. This is not physical bus recovery: a target
+    /// holding SDA/SCL low still needs board-specific recovery or reset.
+    pub fn recover(&mut self) {
+        self.bus.write(CR2, 0);
+        initialize(&mut self.bus, self.ccr);
     }
 
     /// Read one big-endian 16-bit register with a repeated start.
@@ -739,6 +811,13 @@ impl I2c3 {
     /// Write a single data byte (LIS3DH-style register write).
     pub async fn write_register8(&mut self, addr7: u8, reg8: u8, value: u8) -> Result<(), Error> {
         embedded_hal_async::i2c::I2c::write(self, addr7, &[reg8, value]).await
+    }
+}
+
+impl Drop for I2c3 {
+    fn drop(&mut self) {
+        self.bus.write(CR2, 0);
+        control(&mut self.bus, PE, 0);
     }
 }
 

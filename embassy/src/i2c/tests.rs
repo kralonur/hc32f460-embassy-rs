@@ -39,8 +39,46 @@ impl Registers for Io {
 }
 
 #[test]
+fn status_errors_preserve_the_failure_cause() {
+    use embedded_hal::i2c::{Error as _, ErrorKind, NoAcknowledgeSource};
+    assert_eq!(status_error(ARLOF | NACKF), Error::Arbitration);
+    assert_eq!(status_error(NACKF), Error::Nack);
+    assert_eq!(status_error(TMOUTF), Error::PeripheralTimeout);
+    assert_eq!(Error::Arbitration.kind(), ErrorKind::ArbitrationLoss);
+    assert_eq!(
+        Error::Nack.kind(),
+        ErrorKind::NoAcknowledge(NoAcknowledgeSource::Unknown)
+    );
+}
+
+#[test]
+fn cancelled_transaction_masks_all_interrupt_sources() {
+    let mut io = Io::default();
+    io.registers.insert(CR1, PE);
+    io.registers.insert(SR, BUSY);
+    let mut ops = [Operation::Write(&[1])];
+    {
+        let mut future = core::pin::pin!(transfer(&mut io, 0x40, &mut ops));
+        assert_eq!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        );
+    }
+    assert_eq!(io.read(CR2), 0);
+    assert!(io.transmitted.is_empty());
+}
+
+#[test]
 fn baud_rate_never_rounds_above_requested_rate() {
-    for (pclk, frequency) in [(20_000_001, 400_000), (50_000_000, 400_000)] {
+    for (pclk, frequency) in [
+        (20_000_001, 400_000),
+        (50_000_000, 400_000),
+        (50_000_000, 100_000),
+        (50_000_000, 10_000),
+        (234_375, 400_000),
+    ] {
         let ccr = timing(pclk, frequency).unwrap();
         let divider = (ccr >> CCR_FREQ_SHIFT) & 0b111;
         let overhead = 2 * CLOCK_DIVIDERS[divider as usize].1;
@@ -50,6 +88,9 @@ fn baud_rate_never_rounds_above_requested_rate() {
         assert!(u64::from(pclk) <= u64::from(frequency) * u64::from(period));
     }
     assert_eq!(timing(20_000_000, 0), None);
+    assert_eq!(timing(0, 100_000), None);
+    assert_eq!(timing(50_000_000, 1_000), None);
+    assert!((timing(50_000_000, 100_000).unwrap() >> CCR_FREQ_SHIFT) > 1);
 }
 
 #[test]
@@ -57,6 +98,9 @@ fn scl_phases_meet_datasheet_minima() {
     for (pclk, frequency) in [
         (20_000_000, FAST_MAX_HZ),
         (50_000_000, FAST_MAX_HZ),
+        (50_000_000, STANDARD_MAX_HZ),
+        (50_000_000, 10_000),
+        (234_375, FAST_MAX_HZ),
         (6_400_000, STANDARD_MAX_HZ),
         (9_600_000, STANDARD_MAX_HZ),
     ] {
