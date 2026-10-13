@@ -33,9 +33,17 @@ embassy-time-driver = { workspace = true, optional = true }
 embassy-time-queue-utils = { workspace = true, optional = true, features = ["generic-queue-16"] }
 embedded-hal.workspace = true
 embedded-hal-async.workspace = true
+embedded-io.workspace = true
+embedded-io-async.workspace = true
 hc32f460-pac = { path = "../pac", default-features = false, features = ["critical-section"] }
 thiserror = { workspace = true, default-features = false }
 
 # Host register-model tests need std; embedded examples must stay no_std.
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 critical-section = { workspace = true, features = ["std"] }
+
+# Compile-only integration template: the board supplies startup and a linker script.
+[[example]]
+name = "uart"
+crate-type = ["lib"]
+required-features = ["rt"]

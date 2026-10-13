@@ -21,6 +21,7 @@ pub mod pwm;
 pub mod spi;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
+pub mod usart;
 
 /// Initialize SysTick after the board configures its clocks.
 ///

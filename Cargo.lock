@@ -115,6 +115,8 @@ dependencies = [
  "embassy-time-queue-utils",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
+ "embedded-io",
+ "embedded-io-async",
  "hc32f460-pac",
  "thiserror",
 ]
