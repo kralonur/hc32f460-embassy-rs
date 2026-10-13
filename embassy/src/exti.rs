@@ -21,7 +21,8 @@
 //!
 //! Now the ISR clears `EIFR` **and sets a software latch** (`EDGE`); the waiter
 //! consumes the latch. The latch is set before the wake and read after the
-//! waker is registered, so no edge can be lost in either direction.
+//! waker is registered, closing the lost-wakeup race. Multiple edges before
+//! consumption coalesce into one pending event; this is not an edge counter.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -49,12 +50,14 @@ pub fn wake(pin: u8) {
 
 /// Record an edge for `pin` and wake its waiter. Order matters: latch, then wake.
 pub fn note_edge(pin: u8) {
+    assert!(pin <= MAX_CHANNEL);
     EDGE.fetch_or(1 << pin, core::sync::atomic::Ordering::Release);
     wake(pin);
 }
 
 /// Take the latched edge for `pin`, if any.
 pub fn take_edge(pin: u8) -> bool {
+    assert!(pin <= MAX_CHANNEL);
     EDGE.fetch_and(!(1 << pin), core::sync::atomic::Ordering::AcqRel) & (1 << pin) != 0
 }
 
@@ -92,7 +95,11 @@ impl ExtiInput {
     pub unsafe fn new(port: crate::gpio::Port, pin: u8, trigger: crate::intc::EirqTrigger) -> Self {
         // SAFETY: The caller exclusively owns this pin and its external-interrupt channel.
         unsafe { crate::gpio::configure_exti_input(port, pin) };
-        crate::intc::configure_eirq(pin, trigger);
+        critical_section::with(|_| {
+            crate::intc::configure_eirq(pin, trigger);
+            crate::intc::eirq_clear(pin);
+            take_edge(pin);
+        });
         Self { port, pin }
     }
 
@@ -122,15 +129,98 @@ impl ExtiInput {
 
     /// Wait until the pin produces a configured edge (or level) event.
     ///
-    /// Regististers the waker *before* checking the flag, so an interrupt that
+    /// Registers the waker *before* checking the flag, so an interrupt that
     /// arrives between two polls cannot be lost.
     pub async fn wait_for_edge(&mut self) {
         WaitEdge { pin: self.pin }.await
     }
 
+    pub fn is_low(&self) -> bool {
+        !self.is_high()
+    }
+
+    fn arm_edge(&mut self, trigger: crate::intc::EirqTrigger) {
+        // Change only EIRQCR, not GPIO.INTE (the latter requires disabled NVIC
+        // routes per Errata 2.4.2). Clear inherited events before this new wait.
+        critical_section::with(|_| {
+            crate::intc::configure_eirq(self.pin, trigger);
+            crate::intc::eirq_clear(self.pin);
+            take_edge(self.pin);
+        });
+    }
+
+    /// Wait for a new rising edge, ignoring previously latched events.
+    pub async fn wait_for_rising_edge(&mut self) {
+        self.arm_edge(crate::intc::EirqTrigger::Rising);
+        self.wait_for_edge().await;
+    }
+
+    /// Wait for a new falling edge, ignoring previously latched events.
+    pub async fn wait_for_falling_edge(&mut self) {
+        self.arm_edge(crate::intc::EirqTrigger::Falling);
+        self.wait_for_edge().await;
+    }
+
+    pub async fn wait_for_any_edge(&mut self) {
+        self.arm_edge(crate::intc::EirqTrigger::Both);
+        self.wait_for_edge().await;
+    }
+
+    /// Return immediately if high, otherwise latch the next rising edge even
+    /// if the signal falls again before the executor polls this task.
+    pub async fn wait_for_high(&mut self) {
+        self.arm_edge(crate::intc::EirqTrigger::Rising);
+        if !self.is_high() {
+            self.wait_for_edge().await;
+        }
+    }
+
+    pub async fn wait_for_low(&mut self) {
+        self.arm_edge(crate::intc::EirqTrigger::Falling);
+        if !self.is_low() {
+            self.wait_for_edge().await;
+        }
+    }
+
     /// Whether an edge is already latched and not yet consumed.
     pub fn is_pending(&self) -> bool {
         EDGE.load(core::sync::atomic::Ordering::Relaxed) & (1 << self.pin) != 0
+    }
+}
+
+impl embedded_hal::digital::ErrorType for ExtiInput {
+    type Error = core::convert::Infallible;
+}
+
+impl embedded_hal::digital::InputPin for ExtiInput {
+    fn is_high(&mut self) -> Result<bool, Self::Error> {
+        Ok(ExtiInput::is_high(self))
+    }
+    fn is_low(&mut self) -> Result<bool, Self::Error> {
+        Ok(ExtiInput::is_low(self))
+    }
+}
+
+impl embedded_hal_async::digital::Wait for ExtiInput {
+    async fn wait_for_high(&mut self) -> Result<(), Self::Error> {
+        ExtiInput::wait_for_high(self).await;
+        Ok(())
+    }
+    async fn wait_for_low(&mut self) -> Result<(), Self::Error> {
+        ExtiInput::wait_for_low(self).await;
+        Ok(())
+    }
+    async fn wait_for_rising_edge(&mut self) -> Result<(), Self::Error> {
+        ExtiInput::wait_for_rising_edge(self).await;
+        Ok(())
+    }
+    async fn wait_for_falling_edge(&mut self) -> Result<(), Self::Error> {
+        ExtiInput::wait_for_falling_edge(self).await;
+        Ok(())
+    }
+    async fn wait_for_any_edge(&mut self) -> Result<(), Self::Error> {
+        ExtiInput::wait_for_any_edge(self).await;
+        Ok(())
     }
 }
 
@@ -152,3 +242,6 @@ impl Future for WaitEdge {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -81,6 +81,8 @@ fn ungate(gates: impl FnOnce(&mut pac::pwc::fcg3::W) -> &mut pac::pwc::fcg3::W) 
 pub enum Error {
     #[error("pin is not one of the ADC12_IN4..ADC12_IN11 inputs")]
     NotAnInput,
+    #[error("an ADC2 scan must contain between one and nine inputs")]
+    InvalidScan,
     #[error("scan did not end within its bound; it was stopped")]
     Timeout,
     #[error("a running scan did not stop")]
@@ -126,6 +128,18 @@ pub struct AdcPin {
 }
 
 impl AdcPin {
+    /// Consume a unique GPIO token and configure it as an ADC2 input.
+    pub fn from_pin(pin: crate::gpio::Pin) -> Result<Self, Error> {
+        let index = INPUT_PINS
+            .iter()
+            .position(|&input| input == (pin.port(), pin.number()))
+            .ok_or(Error::NotAnInput)?;
+        Ok(Self {
+            input: FIRST_INPUT + index as u8,
+            _pin: pin.into_analog(),
+        })
+    }
+
     /// Make `pin` on `port` analog for ADC2, or refuse it untouched when it
     /// is not an ADC2 input.
     /// # Safety
@@ -200,7 +214,9 @@ impl<const N: usize> Adc2<N> {
     /// Clock ADC2 and set up sequence A for `inputs`: each pin on the next
     /// multiplexed channel, the reference on channel 8. `average` averages
     /// every input. A scan not finished after `timeout` is stopped and
-    /// fails; bound it from the ADC clock and the sampling times.
+    /// fails; bound it from the ADC clock and the sampling times. Empty scans
+    /// are rejected before hardware access; inherited conversions must stop
+    /// successfully before any configuration is replaced.
     /// # Safety
     /// Call once. The caller gives ADC2 and PWC FCG3.ADC2 to this owner.
     pub unsafe fn new(
@@ -208,7 +224,10 @@ impl<const N: usize> Adc2<N> {
         inputs: [Input; N],
         average: Option<Average>,
         timeout: Duration,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        if N == 0 || N > usize::from(INTERNAL_CHANNEL) + 1 {
+            return Err(Error::InvalidScan);
+        }
         // The pins are distinct ADC12 inputs, so at most eight take channels
         // 0..=7 in turn; the one reference takes channel 8.
         let mut next = 0;
@@ -221,7 +240,9 @@ impl<const N: usize> Adc2<N> {
         });
         ungate(|w| w.adc2().clear_bit());
         // DDL `ADC_Init`: stop before configuring, EOC interrupts off.
-        adc.str().write(|w| w.strt().clear_bit());
+        if !stop(&adc) {
+            return Err(Error::NotStopped);
+        }
         adc.icr()
             .write(|w| w.eocaien().clear_bit().eocbien().clear_bit());
         // SAFETY (field writes below): each value fits its field.
@@ -266,12 +287,12 @@ impl<const N: usize> Adc2<N> {
                 }
             }
         }
-        Self {
+        Ok(Self {
             adc,
             _inputs: inputs,
             channels,
             timeout,
-        }
+        })
     }
 
     /// Run one scan and return each input's count, `0..=FULL_SCALE`.
@@ -341,3 +362,6 @@ pub fn on_interrupt() {
     adc.icr().write(|w| w.eocaien().clear_bit());
     WAKER.wake();
 }
+
+#[cfg(test)]
+mod tests;

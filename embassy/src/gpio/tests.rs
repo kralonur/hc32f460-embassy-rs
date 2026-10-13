@@ -20,6 +20,20 @@ impl Registers for Io {
 }
 
 #[test]
+fn pin_allocator_never_hands_out_the_same_pin_twice() {
+    // SAFETY: this host-only allocator regression never accesses MMIO or
+    // converts its tokens into configured pins; no hardware owner exists here.
+    let mut pins = unsafe { split(crate::pac::Gpio::steal()) };
+    let pin = pins.take(Port::A, 4).unwrap();
+    assert_eq!((pin.port(), pin.number()), (Port::A, 4));
+    assert!(pins.take(Port::A, 4).is_none());
+    assert!(pins.take(Port::B, 4).is_some());
+    assert!(pins.take(Port::H, 2).is_some());
+    assert!(pins.take(Port::H, 3).is_none());
+    assert!(pins.take(Port::A, 16).is_none());
+}
+
+#[test]
 fn function_selection_is_latched_and_restores_prior_latch_state() {
     for latch in [0, PCR_LTE] {
         let mut io = Io::default();

@@ -1,6 +1,6 @@
 //! GPIO configuration/access for HC32F460. Pin constructors are unsafe because
-//! allocation is caller-enforced: one owner per pin, no Clone, no drop-time
-//! hardware changes. Configuration unlock/RMW/relock is synchronous and guarded
+//! legacy allocation is caller-enforced. Prefer [`split`] and the unique [`Pin`]
+//! tokens for ownership-checked construction. No Clone or drop-time pin changes. Configuration unlock/RMW/relock is synchronous and guarded
 //! by a critical section; output set/reset/toggle use 16-bit write-one aliases.
 //!
 //! All digital-pin constructors require the caller to stop XTAL32 before using
@@ -47,6 +47,8 @@ const PWPR: usize = BASE + 0x3fc;
 const PSPCR: usize = BASE + 0x3f4;
 // Vendor SVD: input-data register offset within each port, in bytes.
 const PIDR: usize = 0x00;
+// Vendor SVD: the output-data latch, not the pin's electrical input level.
+const PODR: usize = 0x02;
 // Vendor SVD: output-enable register offset within each port, in bytes.
 const POER: usize = 0x06;
 // Vendor SVD: write-one output-set register offset within each port, in bytes.
@@ -222,6 +224,123 @@ pub unsafe fn release_jtag() {
     protected(&mut Mmio, |bus| modify(bus, PSPCR, JTAG_FUNCTIONS, 0));
 }
 
+/// Internal pull resistor selection. HC32F460 provides a pull-up, not a pull-down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pull {
+    None,
+    Up,
+}
+
+/// Exclusive GPIO allocator. Taking a pin permanently removes it from the bank;
+/// dropping a pin does not silently allow another owner to acquire it.
+pub struct Pins {
+    _gpio: crate::pac::Gpio,
+    available: [u16; 6],
+}
+
+/// Transfer GPIO ownership to a pin allocator, without changing any registers.
+///
+/// # Safety
+/// The board must have clocks ready and disable inherited GPIO/EXTI routes.
+/// Stop XTAL32 (including the PC15 reset-time workaround) before digital use of
+/// PC14/PC15, and release debug functions before taking their pins. Do not use
+/// legacy constructors or raw access to reconfigure pins owned by this bank.
+pub unsafe fn split(gpio: crate::pac::Gpio) -> Pins {
+    Pins {
+        _gpio: gpio,
+        available: [
+            u16::MAX,
+            u16::MAX,
+            u16::MAX,
+            u16::MAX,
+            u16::MAX,
+            (1 << H_PIN_COUNT) - 1,
+        ],
+    }
+}
+
+impl Pins {
+    /// Take one unique pin token. Invalid or already-taken pins return `None`
+    /// without register access. The board must select pins bonded on its package.
+    pub fn take(&mut self, port: Port, pin: u8) -> Option<Pin> {
+        if pin >= PINS_PER_PORT {
+            return None;
+        }
+        let bit = 1 << pin;
+        let available = &mut self.available[port.index()];
+        if *available & bit == 0 {
+            return None;
+        }
+        *available &= !bit;
+        Some(Pin { port, pin })
+    }
+}
+
+/// An unconfigured, uniquely owned GPIO pin. Conversions consume the token.
+pub struct Pin {
+    port: Port,
+    pin: u8,
+}
+
+impl Pin {
+    pub fn port(&self) -> Port {
+        self.port
+    }
+
+    pub fn number(&self) -> u8 {
+        self.pin
+    }
+
+    /// Select digital GPIO input and configure the internal pull-up.
+    pub fn into_input(self, pull: Pull) -> InputPin {
+        protected(&mut Mmio, |bus| {
+            pull_up(bus, self.port, self.pin, false);
+            modify(
+                bus,
+                pcr(self.port, self.pin),
+                PCR_PUU,
+                if pull == Pull::Up { PCR_PUU } else { 0 },
+            );
+        });
+        InputPin {
+            port: self.port,
+            pin: self.pin,
+        }
+    }
+
+    /// Select digital push-pull GPIO with high drive at `level`.
+    pub fn into_output(self, level: Level) -> OutputPin {
+        protected(&mut Mmio, |bus| {
+            configured_output(bus, self.port, self.pin, level)
+        });
+        OutputPin {
+            port: self.port,
+            pin: self.pin,
+        }
+    }
+
+    pub fn into_analog(self) -> AnalogPin {
+        protected(&mut Mmio, |bus| analog(bus, self.port, self.pin));
+        AnalogPin {
+            _port: self.port,
+            _pin: self.pin,
+        }
+    }
+
+    /// Select a peripheral function, retaining unique pin ownership.
+    /// # Safety
+    /// The function and electrical mode must be valid for this pin/peripheral.
+    pub unsafe fn into_alternate(self, code: u8, mode: AlternateMode) -> AlternatePin {
+        protected(&mut Mmio, |bus| {
+            alternate(bus, self.port, self.pin, code, mode)
+        });
+        AlternatePin {
+            port: self.port,
+            pin: self.pin,
+        }
+    }
+}
+
 pub struct InputPin {
     port: Port,
     pin: u8,
@@ -295,6 +414,19 @@ impl OutputPin {
     pub fn toggle(&mut self) {
         Mmio.write(port_register(self.port, POTR), 1 << self.pin);
     }
+    #[inline]
+    pub fn set_level(&mut self, level: Level) {
+        write_level(&mut Mmio, self.port, self.pin, level);
+    }
+    /// Read the output latch, not the electrical level on the pad.
+    #[inline]
+    pub fn is_set_high(&self) -> bool {
+        Mmio.read(port_register(self.port, PODR)) & (1 << self.pin) != 0
+    }
+    #[inline]
+    pub fn is_set_low(&self) -> bool {
+        !self.is_set_high()
+    }
 }
 
 // GPIO register accesses have no recoverable software error. Infallible does
@@ -320,6 +452,19 @@ impl embedded_hal::digital::OutputPin for OutputPin {
     }
     fn set_high(&mut self) -> Result<(), Self::Error> {
         OutputPin::set_high(self);
+        Ok(())
+    }
+}
+
+impl embedded_hal::digital::StatefulOutputPin for OutputPin {
+    fn is_set_high(&mut self) -> Result<bool, Self::Error> {
+        Ok(OutputPin::is_set_high(self))
+    }
+    fn is_set_low(&mut self) -> Result<bool, Self::Error> {
+        Ok(OutputPin::is_set_low(self))
+    }
+    fn toggle(&mut self) -> Result<(), Self::Error> {
+        OutputPin::toggle(self);
         Ok(())
     }
 }
@@ -366,8 +511,12 @@ impl<const N: usize> OutputGroup<N> {
     /// Caller must exclusively own these distinct bonded pins and have clocks
     /// ready; debug functions on them must already be released (RM 9.4.12).
     pub unsafe fn new_high_drive(port: Port, pins: [u8; N]) -> Self {
+        let mut seen = 0u16;
         for pin in pins {
             validate(port, pin);
+            let bit = 1 << pin;
+            assert!(seen & bit == 0, "an output group requires distinct pins");
+            seen |= bit;
         }
         protected(&mut Mmio, |bus| {
             for pin in pins {
