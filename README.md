@@ -12,16 +12,24 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
 ## Features
 
 - **Clocks:** HRC and MPLL startup with checked dividers and bus limits.
-- **Interrupts:** INTC routing of peripheral events to NVIC vectors.
-- **GPIO** (digital, analog and grouped output pins) and **async EXTI** external interrupts.
-- **Time:** an Embassy time driver on SysTick.
+- **Interrupts:** INTC routing with RAII route ownership and runtime vector macros.
+- **GPIO:** unique pin tokens, digital/analog/alternate/grouped outputs and
+  `embedded-hal` digital traits, including output-latch state.
+- **Async EXTI:** latched events and `embedded-hal-async::digital::Wait`.
+- **Time:** optional, exact 1 kHz SysTick driver with a multi-deadline queue and
+  cached next expiration (no queue scan on idle ticks).
 - **TimerA4 PWM.**
 - **Async ADC2:** one software-started 12-bit scan of up to eight pins and
   the internal reference, optionally averaged, awaited on its end-of-scan
   interrupt. The scan owns its pins and the reference token, so it cannot
   read a pin twice or channel 8 without the reference.
-- **Async I²C3** master.
-- **Transmit-only SPI3** master, byte by byte or through DMA.
+- **Async I²C3** master with all eight clock prescalers, peripheral recovery,
+  and specific NACK/arbitration/timeout errors.
+- **Async USART1–4:** 8-bit UART, checked integer/fractional baud configuration,
+  optional parity/two stop bits, borrowed full-duplex halves, and
+  `embedded-io-async` traits. No heap allocation or ISR buffer pointers.
+- **Transmit-only SPI3** master, byte by byte or through DMA, with typed mode/rate
+  configuration and automatic IRQ-route release.
 - **Async DMA1/DMA2:** event-paced byte copies from memory to a peripheral
   register, awaited on the channel's completion interrupt; dropping a
   transfer stops its channel.
@@ -38,15 +46,68 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
   analog watchdog.
 - SPI: one-frame, 8-bit master transmit only; no receive, no slave mode, and
   gaps between frames are unavoidable.
+- UART: one-byte hardware receive storage, no RX ring or DMA. Transmit-complete
+  pacing avoids Errata 4.5.1 but can leave executor-dependent gaps between bytes.
+  Sustained high-rate receive is not guaranteed; overrun is reported explicitly.
 - DMA: memory-to-peripheral byte copies only, at most 65,535 per transfer, one
-  running channel per unit; no peripheral-to-memory, wider items, repeat,
+  running channel per unit (enforced with `Error::Busy`); no peripheral-to-memory,
+  wider items, repeat,
   non-sequential, linked-list or reconfiguration modes.
+- Borrowed SPI DMA is explicitly unsafe: forgetting a polled future can leave
+  DMA reading expired memory. `write_dma_static` is safe for immutable static
+  buffers. Cancellation waits for DMA quiescence; a permanently wedged bus can
+  stall cancellation instead of releasing memory still used by hardware.
 - No stop or power-down mode support; SysTick time stops while its clock does.
+  Masking interrupts for an entire tick loses time; HCLK must stay unchanged.
 - The board owns power mode, SRAM wait states, memory placement, the shared
   32 kHz crystal and the linker/startup code (see the obligations under
   [Hardware reference documents](#hardware-reference-documents)).
 - Host tests simulate the registers; they do not prove timing or behaviour on
   silicon.
+
+## Integration
+
+The HAL stays `no_std` and allocation-free. It does not pick a board, executor,
+linker script, power mode or pin mux for the application.
+
+```toml
+embassy-hc32 = { path = "path/to/embassy", features = ["rt", "critical-section-single-core"] }
+```
+
+- `time-driver` is enabled by default. Pass an owned Cortex-M `SYST` token and
+  the actual HCLK to `time_driver::init`; forward the SysTick exception to
+  `time_driver::systick_tick`. Initialization is fallible and once-only. Disable
+  default features to use a board-provided Embassy time driver/tick frequency.
+- `rt` exports PAC vector support, including `pac::interrupt` attributes.
+- `critical-section-single-core` supplies Cortex-M critical sections. Omit it
+  when the board/RTOS provides its own implementation; link exactly one.
+- `pac::Peripherals::take()` is available through the HAL. `gpio::split(p.gpio)`
+  transfers GPIO to a unique-pin allocator; its unsafe startup contract covers
+  oscillator/debug/EXTI obligations. `Pins::take` and GPIO conversions then
+  enforce pin ownership without repeated unsafe allocation.
+- Keep an `intc::Route` alive until its peripheral stops generating interrupts.
+  SPI3 manages its fixed routes internally; other drivers let the board choose
+  vectors. Every used async source must have a routed, installed handler.
+
+The [UART integration template](embassy/examples/uart.rs) compiles as a library
+example so it can demonstrate real checked interrupt attributes and RAII routes
+without pretending to provide a board's reset/linker/executor configuration:
+
+```sh
+cargo check -p embassy-hc32 --locked --example uart --features rt --target thumbv7em-none-eabihf
+```
+
+See [architecture and migration](docs/architecture.md) and the
+[hardware acceptance checklist](docs/hardware-validation.md).
+
+### API changes
+
+- `Adc2::new` now returns `Result`: reject empty scans and failed inherited stops.
+- `Spi3::write_dma` is now unsafe for borrowed buffers. Await or drop its future;
+  do not forget it after polling. Use `write_dma_static` for safe static sources.
+- I²C exposes additional error variants, so exhaustive error matches need updating.
+- Legacy raw GPIO/I²C/SysTick constructors remain for board migration; prefer
+  the owned-token APIs for new code.
 
 ## Hardware reference documents
 
@@ -102,8 +163,10 @@ If a download link fails, use the official product page above.
 
 ### Implementation review against these documents
 
-The handwritten HAL was reviewed against the latest Chinese manual, errata,
-English datasheet, and current DDL sources/header. Relevant unchanged English
+The original handwritten HAL was reviewed against the latest Chinese manual,
+errata, English datasheet, and current DDL sources/header. The subsequently added
+USART driver was checked against RM 25.5, the committed header/SVD, the vendor
+UART implementation, and Errata 4.5.1–4.5.2; it has not been validated on silicon. Relevant unchanged English
 sections remain the preferred citations. This is a source/register-sequence
 review, not a claim of validation on silicon or of correctness of every register
 in the generated PAC.
@@ -210,8 +273,18 @@ formats the generated Rust, and preserves the workspace manifests.
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --locked --target thumbv7em-none-eabihf
-cargo clippy --workspace --locked --target thumbv7em-none-eabihf -- -D warnings
+cargo check -p embassy-hc32 --locked --no-default-features --target thumbv7em-none-eabihf
+cargo clippy --workspace --locked --all-features --target thumbv7em-none-eabihf -- -D warnings
+cargo clippy --workspace --locked --all-targets --features embassy-hc32/rt -- -D warnings
+cargo test -p embassy-hc32 --locked --lib
+cargo test -p embassy-hc32 --locked --doc
+cargo build --workspace --locked --release --all-features --target thumbv7em-none-eabihf
 ```
+
+CI checks the host register models, default/custom time-driver feature builds,
+embedded linting, UART integration template and optimized release compilation.
+The release profile enables thin LTO and one codegen unit, retaining debug
+symbols. These are build settings, not a measured throughput/latency claim.
 
 ## License
 
