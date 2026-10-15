@@ -119,13 +119,10 @@ impl Adc1 {
         // mask fits its select field; gain and enable are DDL encodings.
         adc.chselra()
             .write(|w| unsafe { w.chsela().bits(1 << channel) });
-        // SAFETY: SSTR0..7 are consecutive bytes; CHMUXR0..1 consecutive
-        // halfwords, each containing four 4-bit fields. channel is at most 7.
+        write_sample_time(&adc, channel, sample_time);
+        // SAFETY: CHMUXR0..1 are consecutive halfwords, each containing four
+        // 4-bit fields. channel is at most 7.
         unsafe {
-            adc.sstr0()
-                .as_ptr()
-                .add(usize::from(channel))
-                .write_volatile(sample_time.0);
             let shift = usize::from(channel) % MUX_FIELDS_PER_REGISTER * MUX_FIELD_BITS;
             let mux = adc
                 .chmuxr0()
@@ -150,6 +147,16 @@ impl Adc1 {
             dma,
             timeout,
         })
+    }
+
+    /// Change the input's sampling time between captures, e.g. for a slower
+    /// sample rate. Takes effect on the next [`Self::capture`].
+    pub fn set_sample_time(&mut self, sample_time: SampleTime) -> Result<(), Error> {
+        if !stop(&self.adc) {
+            return Err(Error::NotStopped);
+        }
+        write_sample_time(&self.adc, self.input.channel, sample_time);
+        Ok(())
     }
 
     /// Capture consecutive samples. A timeout, DMA error or cancellation
@@ -199,6 +206,17 @@ impl Drop for Adc1 {
     fn drop(&mut self) {
         stop(&self.adc);
         self.adc.pgacr().reset();
+    }
+}
+
+/// Write `channel`'s sampling time; the caller has stopped conversion.
+fn write_sample_time(adc: &pac::Adc1, channel: u8, sample_time: SampleTime) {
+    // SAFETY: SSTR0..7 are consecutive bytes; the owned PGA channel is at most 7.
+    unsafe {
+        adc.sstr0()
+            .as_ptr()
+            .add(usize::from(channel))
+            .write_volatile(sample_time.0);
     }
 }
 
