@@ -1,13 +1,12 @@
-//! Async DMA1/DMA2: one event-paced byte copy from memory to a fixed
-//! peripheral register per channel, awaited on its transfer-complete
-//! interrupt. No peripheral-to-memory, wider items, repeat, non-sequential,
-//! linked-list or reconfiguration modes.
+//! Async DMA1/DMA2: event-paced byte writes to a peripheral or halfword
+//! reads into memory, awaited on transfer completion. No repeat,
+//! non-sequential, linked-list or reconfiguration modes.
 //!
 //! [`split`] clocks a unit, stops any channel left running and hands out
-//! its four [`Channel`]s. [`Channel::write`] arms one transfer: every
-//! trigger event moves the next byte, and the returned [`Transfer`] resolves
-//! once the last byte is written. Dropping it early stops the channel, so the
-//! transfer never outlives the borrowed bytes.
+//! its four [`Channel`]s. [`Channel::write`] and [`Channel::read_u16`] arm
+//! one transfer: every trigger event moves the next item, and the returned
+//! [`Transfer`] resolves after the last one. Dropping it early stops the
+//! channel, so the transfer never outlives the borrowed buffer.
 //!
 //! The application routes each used channel's [`Unit::complete_event`]
 //! and its unit's [`Unit::error_event`] to NVIC lines inside their group
@@ -35,7 +34,7 @@ use crate::pac::events::EventSource;
 
 /// Channels per unit (DDL `DmaChMax`).
 pub const CHANNELS: usize = 4;
-/// Most bytes one transfer moves: DTCTL.CNT is a 16-bit count of one-byte
+/// Most items one transfer moves: DTCTL.CNT is a 16-bit count of single-item
 /// blocks (SVD; DDL `IS_VALID_TRNCNT`).
 pub const MAX_TRANSFER: usize = u16::MAX as usize;
 
@@ -47,9 +46,30 @@ const ADDRESS_FIXED: u8 = 0;
 const ADDRESS_INCREMENT: u8 = 1;
 // DDL `Dma8Bit` (CHCTL.HSIZE).
 const WIDTH_8: u8 = 0;
+// DDL `Dma16Bit` (CHCTL.HSIZE): one aligned halfword per item.
+const WIDTH_16: u8 = 1;
 // One item per trigger event (DTCTL.BLKSIZE; 0 would mean 1024, DDL
 // `stc_dma_config_t`).
 const BLOCK_SIZE: u16 = 1;
+
+/// The supported transfer shapes: which side advances and the item width.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// Memory bytes into a fixed peripheral register.
+    WriteBytes,
+    /// A fixed peripheral halfword register into memory.
+    ReadHalfwords,
+}
+
+impl Kind {
+    /// CHCTL (SINC, DINC, HSIZE) for this shape.
+    const fn fields(self) -> (u8, u8, u8) {
+        match self {
+            Self::WriteBytes => (ADDRESS_INCREMENT, ADDRESS_FIXED, WIDTH_8),
+            Self::ReadHalfwords => (ADDRESS_FIXED, ADDRESS_INCREMENT, WIDTH_16),
+        }
+    }
+}
 // DDL `EVT_MAX`: a trigger selection no event drives, set while unused.
 const NO_TRIGGER: u16 = 0x1ff;
 // FCG0PC: DDL `ENABLE_FCG0_REG_WRITE`/`DISABLE_FCG0_REG_WRITE` write key
@@ -112,7 +132,7 @@ impl Unit {
 /// What ended a transfer early.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    #[error("more than MAX_TRANSFER bytes")]
+    #[error("more than MAX_TRANSFER items")]
     TooLong,
     #[error("another channel of this DMA unit is running")]
     Busy,
@@ -205,6 +225,48 @@ impl Channel {
         trigger: EventSource,
     ) -> Result<Transfer<'a>, Error> {
         let count = u16::try_from(source.len()).map_err(|_| Error::TooLong)?;
+        self.start(
+            source.as_ptr(),
+            destination,
+            count,
+            trigger,
+            Kind::WriteBytes,
+        )
+    }
+
+    /// Copy the fixed halfword register at `source` into `destination`, one
+    /// sample per `trigger`. The channel is armed before returning.
+    ///
+    /// # Safety
+    /// `source` must be an aligned peripheral register accepting halfword
+    /// reads, paced by `trigger`. The destination must remain alive and
+    /// exclusively DMA-owned until quiescence, even if the transfer is
+    /// forgotten. Await or drop the transfer; never leak it with a borrowed
+    /// buffer. Do not read samples before completion or cancellation.
+    pub unsafe fn read_u16<'a>(
+        &'a mut self,
+        source: *const u16,
+        destination: &'a mut [u16],
+        trigger: EventSource,
+    ) -> Result<Transfer<'a>, Error> {
+        let count = u16::try_from(destination.len()).map_err(|_| Error::TooLong)?;
+        self.start(
+            source.cast(),
+            destination.as_mut_ptr().cast(),
+            count,
+            trigger,
+            Kind::ReadHalfwords,
+        )
+    }
+
+    fn start(
+        &mut self,
+        source: *const u8,
+        destination: *mut u8,
+        count: u16,
+        trigger: EventSource,
+        kind: Kind,
+    ) -> Result<Transfer<'_>, Error> {
         self.stop()?;
         if count == 0 {
             return Ok(Transfer {
@@ -233,21 +295,22 @@ impl Channel {
         chctl.modify(|_, w| w.ie().clear_bit());
         // SAFETY (field writes below): each value fits its field; addresses
         // are 32-bit on this part.
-        sar.write(|w| unsafe { w.bits(source.as_ptr() as u32) });
+        sar.write(|w| unsafe { w.bits(source as u32) });
         dar.write(|w| unsafe { w.bits(destination as u32) });
         dtctl.write(|w| unsafe { w.blksize().bits(BLOCK_SIZE).cnt().bits(count) });
+        let (source_step, destination_step, width) = kind.fields();
         chctl.write(|w| unsafe {
             w.sinc()
-                .bits(ADDRESS_INCREMENT)
+                .bits(source_step)
                 .dinc()
-                .bits(ADDRESS_FIXED)
+                .bits(destination_step)
                 .hsize()
-                .bits(WIDTH_8)
+                .bits(width)
                 .ie()
                 .set_bit()
         });
-        // Every block is one byte, so the block-complete interrupt would
-        // fire per byte: mask it, and unmask completion and errors (DDL
+        // Every block is one item, so the block-complete interrupt would
+        // fire per sample: mask it, and unmask completion and errors (DDL
         // `DMA_EnableIrq`/`DMA_DisableIrq`).
         let bit = 1 << self.index;
         critical_section::with(|_| {
@@ -360,10 +423,10 @@ impl Channel {
     }
 }
 
-/// A running [`Channel::write`]; resolves once the last byte is written.
+/// A running DMA write or read; resolves after the last item.
 /// Dropping it first stops the channel and waits until it no longer accesses
-/// the source buffer. A permanently wedged DMA bus stalls instead of returning
-/// borrowed memory to its owner while it is still being read.
+/// the buffer. A permanently wedged DMA bus stalls instead of returning
+/// borrowed memory to its owner while it is still being accessed.
 #[must_use = "a DMA transfer must be awaited or dropped, never leaked"]
 pub struct Transfer<'a> {
     channel: &'a mut Channel,

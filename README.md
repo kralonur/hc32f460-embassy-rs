@@ -23,6 +23,9 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
   the internal reference, optionally averaged, awaited on its end-of-scan
   interrupt. The scan owns its pins and the reference token, so it cannot
   read a pin twice or channel 8 without the reference.
+- **Async ADC1:** one continuous 12-bit external input, PGA gain two against
+  internal analog ground, captured into halfword buffers by event-paced DMA.
+  Captures are timeout-bounded and stop conversion on cancellation.
 - **Async I²C3** master with all eight clock prescalers, peripheral recovery,
   and specific NACK/arbitration/timeout errors.
 - **Async USART1–4:** 8-bit UART, checked integer/fractional baud configuration,
@@ -30,9 +33,9 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
   `embedded-io-async` traits. No heap allocation or ISR buffer pointers.
 - **Transmit-only SPI3** master, byte by byte or through DMA, with typed mode/rate
   configuration and automatic IRQ-route release.
-- **Async DMA1/DMA2:** event-paced byte copies from memory to a peripheral
-  register, awaited on the channel's completion interrupt; dropping a
-  transfer stops its channel.
+- **Async DMA1/DMA2:** event-paced byte writes to a peripheral or halfword
+  reads into memory, awaited on the channel's completion interrupt; dropping
+  a transfer stops its channel and waits for quiescence.
 - **PAC:** every register of the vendor SVD, plus the 144 INTC vectors and
   the interrupt-event identifiers the SVD lacks.
 
@@ -42,17 +45,20 @@ Rust support for the HC32F460 microcontroller: a peripheral access crate
   registers, unaudited.
 - I²C: a read followed by a repeated-start write is refused
   (`Error::ReadRestart`); write-then-read is supported.
-- ADC: ADC2 sequence A only, 12 bits; no ADC1, sequence B, triggers, DMA or
-  analog watchdog.
+- ADC: 12-bit sequence A only; ADC1 captures one PGA input on PA0..PA7
+  with gain two and internal analog ground. No sequence B, external conversion
+  triggers, other gains or analog watchdog.
 - SPI: one-frame, 8-bit master transmit only; no receive, no slave mode, and
   gaps between frames are unavoidable.
 - UART: one-byte hardware receive storage, no RX ring or DMA. Transmit-complete
   pacing avoids Errata 4.5.1 but can leave executor-dependent gaps between bytes.
   Sustained high-rate receive is not guaranteed; overrun is reported explicitly.
-- DMA: memory-to-peripheral byte copies only, at most 65,535 per transfer, one
-  running channel per unit (enforced with `Error::Busy`); no peripheral-to-memory,
-  wider items, repeat,
-  non-sequential, linked-list or reconfiguration modes.
+- DMA: byte writes and halfword reads only, at most 65,535 items per transfer,
+  one running channel per unit (enforced with `Error::Busy`); no other widths,
+  repeat, non-sequential, linked-list or reconfiguration modes.
+- Borrowed ADC captures and DMA reads are explicitly unsafe: never forget a
+  polled future or access its buffer before completion/cancellation. Their
+  cancellation waits for DMA quiescence, including on timeout.
 - Borrowed SPI DMA is explicitly unsafe: forgetting a polled future can leave
   DMA reading expired memory. `write_dma_static` is safe for immutable static
   buffers. Cancellation waits for DMA quiescence; a permanently wedged bus can

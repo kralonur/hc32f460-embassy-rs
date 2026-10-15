@@ -1,6 +1,7 @@
-//! Async ADC2: one software-started scan of sequence A at 12 bits, optionally
-//! averaged, awaited on its end-of-scan interrupt. No ADC1, sequence B,
-//! triggers, DMA, analog watchdog or other resolutions.
+//! Async ADC2 scans and amplified ADC1 DMA captures at 12 bits.
+//! ADC2 performs one optionally averaged sequence A scan on its end-of-scan
+//! interrupt. ADC1 captures a single continuous input; see [`Adc1`].
+//! No sequence B, external conversion triggers or analog watchdog.
 //!
 //! Ownership makes a scan valid by construction: [`Adc2::new`] takes the
 //! [`AdcPin`]s it reads (one per ADC12 input pin, so none twice and at most
@@ -23,6 +24,9 @@ use embassy_time::{Duration, Timer, with_timeout};
 
 use crate::gpio::{AnalogPin, Port};
 use crate::pac;
+
+mod capture;
+pub use capture::{Adc1, AmplifiedPin, CaptureError};
 
 /// Largest result: 2^12 − 1 at the 12-bit resolution this driver sets.
 pub const FULL_SCALE: u16 = (1 << 12) - 1;
@@ -81,6 +85,8 @@ fn ungate(gates: impl FnOnce(&mut pac::pwc::fcg3::W) -> &mut pac::pwc::fcg3::W) 
 pub enum Error {
     #[error("pin is not one of the ADC12_IN4..ADC12_IN11 inputs")]
     NotAnInput,
+    #[error("pin is not one of the PA0..PA7 amplified ADC1 inputs")]
+    NotAmplifiedInput,
     #[error("an ADC2 scan must contain between one and nine inputs")]
     InvalidScan,
     #[error("scan did not end within its bound; it was stopped")]
